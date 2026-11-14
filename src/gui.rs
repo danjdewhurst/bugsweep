@@ -1,13 +1,20 @@
 //! Desktop window. It shows the same views as the terminal interface.
+//!
+//! A separate thread runs [`pump`], which gives each Bluetooth and sweep
+//! event to the shared [`Live`] state. So the session and the log stay
+//! current also while the system does not draw the window, for example when
+//! the window is hidden.
 
 use std::collections::VecDeque;
 use std::sync::mpsc::Receiver;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui::{
     self, Align, Button, CentralPanel, Color32, Context, Grid, Label, Layout, ProgressBar, RichText,
-    ScrollArea, Sense, Shape, SidePanel, Stroke, TopBottomPanel, Ui, pos2, vec2,
+    ScrollArea, Sense, Shape, SidePanel, Stroke, TopBottomPanel, Ui, Visuals, pos2, vec2,
 };
+use egui_extras::{Column, TableBuilder, TableRow};
 
 use crate::ble::BleEvent;
 use crate::lan::{LanReport, Verdict};
@@ -22,6 +29,11 @@ use crate::tui::{
 const GREEN: Color32 = Color32::from_rgb(40, 170, 90);
 const BLUE: Color32 = Color32::from_rgb(60, 140, 230);
 const CYAN: Color32 = Color32::from_rgb(0, 160, 200);
+/// Time between two redraws outside the finder. The ages in the list
+/// change once a second.
+const IDLE_REPAINT: Duration = Duration::from_secs(1);
+/// Height of one row in the device list.
+const ROW_HEIGHT: f32 = 22.0;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum View {
@@ -37,70 +49,18 @@ enum LanState {
     Failed(String),
 }
 
-pub struct Gui<'a> {
+/// The state that the events change. The window and the event thread
+/// share it.
+pub struct Live {
     session: Session,
-    events: Receiver<AppEvent>,
-    start_lan: &'a dyn Fn(),
-    view: View,
-    /// Show the devices without a finding too.
-    show_all: bool,
-    selected: Option<String>,
-    /// Device ID that the finder follows, and its signal history.
-    finder: Option<String>,
-    finder_history: VecDeque<u16>,
-    last_sample: Instant,
     ble_status: String,
     ble_ok: bool,
     lan: LanState,
-    /// Show the hosts without camera evidence too.
-    lan_show_all: bool,
-    followers: Vec<Follower>,
 }
 
-impl<'a> Gui<'a> {
-    /// `start_lan` starts one network sweep, whose result must arrive on
-    /// `events` as `AppEvent::Lan`.
-    pub fn new(session: Session, events: Receiver<AppEvent>, start_lan: &'a dyn Fn()) -> Self {
-        Gui {
-            session,
-            events,
-            start_lan,
-            view: View::Devices,
-            show_all: true,
-            selected: None,
-            finder: None,
-            finder_history: VecDeque::new(),
-            last_sample: Instant::now(),
-            ble_status: "starting".into(),
-            ble_ok: false,
-            lan: LanState::Idle,
-            lan_show_all: false,
-            followers: Vec::new(),
-        }
-    }
-
-    /// Handle the new events and draw one frame.
-    pub fn show(&mut self, ctx: &Context) {
-        while let Ok(event) = self.events.try_recv() {
-            self.on_event(event);
-        }
-        if self.last_sample.elapsed() >= TICK {
-            self.last_sample = Instant::now();
-            self.sample_finder();
-        }
-        // New adverts arrive all the time, so draw again soon.
-        ctx.request_repaint_after(TICK);
-
-        TopBottomPanel::top("header").show(ctx, |ui| self.header(ui));
-        TopBottomPanel::bottom("footer").show(ctx, |ui| {
-            ui.weak("Radio check only. A device that sends no radio signal stays hidden.");
-        });
-        CentralPanel::default().show(ctx, |ui| match (&self.finder, self.view) {
-            (Some(_), _) => self.finder_view(ui),
-            (None, View::Devices) => self.devices_view(ui),
-            (None, View::Network) => self.network_view(ui),
-            (None, View::Followers) => self.followers_view(ui),
-        });
+impl Live {
+    pub fn new(session: Session) -> Self {
+        Live { session, ble_status: "starting".into(), ble_ok: false, lan: LanState::Idle }
     }
 
     fn on_event(&mut self, event: AppEvent) {
@@ -122,12 +82,84 @@ impl<'a> Gui<'a> {
             AppEvent::Lan(Err(error)) => self.lan = LanState::Failed(error),
         }
     }
+}
 
-    fn sample_finder(&mut self) {
-        let Some(device) = self.finder.as_deref().and_then(|id| self.session.get(id)) else {
+/// Give each event to `live`, until all senders are gone.
+pub fn pump(events: Receiver<AppEvent>, live: &Mutex<Live>) {
+    for event in events {
+        lock(live).on_event(event);
+    }
+}
+
+/// A panic while the lock was held does not make the state unusable, so
+/// use it also when the lock is poisoned.
+fn lock(live: &Mutex<Live>) -> MutexGuard<'_, Live> {
+    live.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+pub struct Gui<'a> {
+    live: Arc<Mutex<Live>>,
+    start_lan: &'a dyn Fn(),
+    view: View,
+    /// Show the devices without a finding too.
+    show_all: bool,
+    selected: Option<String>,
+    /// Device ID that the finder follows, and its signal history.
+    finder: Option<String>,
+    finder_history: VecDeque<u16>,
+    last_sample: Instant,
+    /// Show the hosts without camera evidence too.
+    lan_show_all: bool,
+    followers: Vec<Follower>,
+}
+
+impl<'a> Gui<'a> {
+    /// `start_lan` starts one network sweep, whose result must reach `live`
+    /// as `AppEvent::Lan`.
+    pub fn new(live: Arc<Mutex<Live>>, start_lan: &'a dyn Fn()) -> Self {
+        Gui {
+            live,
+            start_lan,
+            view: View::Devices,
+            show_all: true,
+            selected: None,
+            finder: None,
+            finder_history: VecDeque::new(),
+            last_sample: Instant::now(),
+            lan_show_all: false,
+            followers: Vec::new(),
+        }
+    }
+
+    /// Draw one frame.
+    pub fn show(&mut self, ctx: &Context) {
+        let shared = Arc::clone(&self.live);
+        let mut live = lock(&shared);
+        if self.last_sample.elapsed() >= TICK {
+            self.last_sample = Instant::now();
+            self.sample_finder(&live.session);
+        }
+        // The finder follows the signal closely. The other views change at
+        // most once a second.
+        ctx.request_repaint_after(if self.finder.is_some() { TICK } else { IDLE_REPAINT });
+
+        TopBottomPanel::top("header").show(ctx, |ui| self.header(ui, &live));
+        TopBottomPanel::bottom("footer").show(ctx, |ui| {
+            ui.weak("Radio check only. A device that sends no radio signal stays hidden.");
+        });
+        CentralPanel::default().show(ctx, |ui| match (&self.finder, self.view) {
+            (Some(_), _) => self.finder_view(ui, &live.session),
+            (None, View::Devices) => self.devices_view(ui, &mut live.session),
+            (None, View::Network) => self.network_view(ui, &mut live.lan),
+            (None, View::Followers) => self.followers_view(ui, &live.session),
+        });
+    }
+
+    fn sample_finder(&mut self, session: &Session) {
+        let Some(device) = self.finder.as_deref().and_then(|id| session.get(id)) else {
             return;
         };
-        if self.finder_history.len() == FINDER_SAMPLES {
+        while self.finder_history.len() >= FINDER_SAMPLES {
             self.finder_history.pop_front();
         }
         self.finder_history.push_back(device.rssi_avg.map(signal_percent).unwrap_or(0));
@@ -138,27 +170,21 @@ impl<'a> Gui<'a> {
         self.finder_history.clear();
     }
 
-    fn start_sweep(&mut self) {
-        self.lan = LanState::Running(Instant::now());
-        (self.start_lan)();
-    }
-
     // ------------------------------------------------------------ panels
 
-    fn header(&mut self, ui: &mut Ui) {
-        let all = self.session.sorted(true);
-        let flagged = all.iter().filter(|d| self.session.is_flagged(d)).count();
-        let devices = all.len();
+    fn header(&mut self, ui: &mut Ui, live: &Live) {
+        let session = &live.session;
+        let flagged = session.flagged_count();
         ui.horizontal_wrapped(|ui| {
             ui.heading("bugsweep");
             ui.separator();
             ui.label("Bluetooth:");
-            let colour = if self.ble_ok { GREEN } else { ui.visuals().error_fg_color };
-            ui.colored_label(colour, &self.ble_status);
+            let colour = if live.ble_ok { GREEN } else { ui.visuals().error_fg_color };
+            ui.colored_label(colour, &live.ble_status);
             ui.separator();
-            ui.label(format!("Place: {}", self.session.place));
+            ui.label(format!("Place: {}", session.place));
             ui.separator();
-            ui.label(format!("Devices: {devices}"));
+            ui.label(format!("Devices: {}", session.len()));
             ui.separator();
             let flagged_text = RichText::new(format!("Flagged: {flagged}"));
             ui.label(if flagged > 0 {
@@ -166,28 +192,33 @@ impl<'a> Gui<'a> {
             } else {
                 flagged_text
             });
-            if let Some(error) = &self.session.store_error {
+            if let Some(error) = &session.store_error {
                 ui.separator();
                 ui.colored_label(ui.visuals().error_fg_color, format!("Log error: {error}"));
             }
         });
         ui.horizontal(|ui| {
-            let before = self.view;
-            ui.selectable_value(&mut self.view, View::Devices, "Bluetooth");
-            ui.selectable_value(&mut self.view, View::Network, "Network cameras");
-            ui.selectable_value(&mut self.view, View::Followers, "Followers");
-            if self.view != before {
-                self.open_finder(None);
-                if self.view == View::Followers {
-                    self.followers = self.session.followers();
+            let tabs = [
+                (View::Devices, "Bluetooth"),
+                (View::Network, "Network cameras"),
+                (View::Followers, "Followers"),
+            ];
+            for (view, title) in tabs {
+                // A click on a tab also leaves the finder, which shows under the Bluetooth tab.
+                if ui.selectable_label(self.view == view, title).clicked() {
+                    self.view = view;
+                    self.open_finder(None);
+                    if view == View::Followers {
+                        self.followers = session.followers();
+                    }
                 }
             }
         });
         ui.add_space(2.0);
     }
 
-    fn devices_view(&mut self, ui: &mut Ui) {
-        let devices = self.session.sorted(self.show_all);
+    fn devices_view(&mut self, ui: &mut Ui, session: &mut Session) {
+        let devices = session.sorted(self.show_all);
         // Keep the selection on the same device when the order changes.
         let selected = self
             .selected
@@ -205,8 +236,8 @@ impl<'a> Gui<'a> {
         details.show_inside(ui, |ui| {
             ui.heading("Details");
             ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-                match selected.as_deref().and_then(|id| self.session.get(id)) {
-                    Some(device) => action = self.details(ui, device),
+                match selected.as_deref().and_then(|id| session.get(id)) {
+                    Some(device) => action = details_pane(ui, session, device),
                     None if self.show_all => _ = ui.label("No devices yet."),
                     None => _ = ui.label("No flagged devices."),
                 }
@@ -215,144 +246,39 @@ impl<'a> Gui<'a> {
         CentralPanel::default().show_inside(ui, |ui| {
             ui.checkbox(&mut show_all, "Show devices without a finding");
             ui.add_space(4.0);
-            ScrollArea::both().show(ui, |ui| {
-                Grid::new("devices").striped(true).num_columns(7).spacing([12.0, 6.0]).show(ui, |ui| {
-                    for title in ["Level", "Type", "Device", "Finding", "Signal", "Distance", "Seen"] {
-                        ui.strong(title);
-                    }
-                    ui.end_row();
-                    for device in &devices {
-                        if self.device_row(ui, device, selected.as_deref() == Some(&device.advert.id)) {
-                            clicked = Some(device.advert.id.clone());
-                        }
-                        ui.end_row();
-                    }
-                });
-            });
+            clicked = device_table(ui, session, &devices, selected.as_deref());
         });
 
         self.show_all = show_all;
+        // The buttons act on the device that the details pane showed.
+        match (action, &selected) {
+            (Some(DeviceAction::Find), Some(_)) => self.open_finder(selected.clone()),
+            (Some(DeviceAction::ToggleKnown), Some(id)) => _ = session.toggle_known(id),
+            _ => {}
+        }
         self.selected = clicked.or(selected);
-        match action {
-            Some(DeviceAction::Find) => self.open_finder(self.selected.clone()),
-            Some(DeviceAction::ToggleKnown) => {
-                if let Some(id) = &self.selected {
-                    self.session.toggle_known(id);
-                }
-            }
-            None => {}
-        }
     }
 
-    /// Draw one row of the device list. Returns `true` when the user
-    /// clicked the device.
-    fn device_row(&self, ui: &mut Ui, device: &Device, selected: bool) -> bool {
-        let level = self.session.level(device);
-        let signature = self.session.top_signature(device);
-        let dim = device.known || device.age() > STALE_AFTER;
-        let text = |text: String| {
-            let text = RichText::new(text);
-            if dim { text.weak() } else { text }
-        };
-
-        let tag = level.map(level_tag).unwrap_or("");
-        ui.label(match level {
-            Some(level) if !dim => RichText::new(tag).strong().color(level_colour(ui, level)),
-            _ => text(tag.into()),
-        });
-        ui.label(text(signature.map(|sig| sig.category.label()).unwrap_or("").into()));
-        let title = device.title().unwrap_or_else(|| "(no name)".into());
-        let clicked = ui.selectable_label(selected, text(title)).clicked();
-        ui.label(text(finding_text(&self.session, device)));
-        match device.rssi_avg {
-            Some(rssi) => {
-                _ = ui.add(
-                    ProgressBar::new(signal_percent(rssi) as f32 / 100.0)
-                        .desired_width(110.0)
-                        .text(format!("{rssi:.0} dBm")),
-                )
-            }
-            None => _ = ui.label(""),
-        }
-        ui.label(text(device.distance_m().map(format_distance).unwrap_or_default()));
-        ui.label(text(format_age(device.age())));
-        clicked
-    }
-
-    fn details(&self, ui: &mut Ui, device: &Device) -> Option<DeviceAction> {
-        let mut action = None;
-        ui.horizontal(|ui| {
-            if ui.button("Find this device").clicked() {
-                action = Some(DeviceAction::Find);
-            }
-            let mark = if device.known { "Not my device" } else { "Mark as my device" };
-            if ui.button(mark).clicked() {
-                action = Some(DeviceAction::ToggleKnown);
-            }
-        });
-        ui.add_space(6.0);
-
-        for &index in &device.hits {
-            let sig = self.session.db().get(index);
-            ui.horizontal_wrapped(|ui| {
-                ui.label(
-                    RichText::new(level_tag(sig.severity)).strong().color(level_colour(ui, sig.severity)),
-                );
-                ui.strong(&sig.name);
-            });
-            ui.weak(format!("Confidence {}; {}", sig.confidence.label(), sig.evidence.describe()));
-            if let Some(notes) = &sig.notes {
-                ui.label(notes);
-            }
-            ui.weak(format!("Source: {}", sig.source));
-            ui.add_space(6.0);
-        }
-        if let Some(follow) = device.follow() {
-            let warning = format!("{} Mark it as your device if it is yours.", follow_warning(follow));
-            ui.colored_label(ui.visuals().warn_fg_color, warning);
-            ui.add_space(6.0);
-        }
-        if device.hits.is_empty() && device.follow().is_none() {
-            ui.weak("No finding for this device.");
-            ui.add_space(6.0);
-        }
-
-        // The value column takes the rest of the panel, and long hex data wraps.
-        let value_width = (ui.available_width() - 100.0).max(120.0);
-        Grid::new("fields").num_columns(2).spacing([12.0, 4.0]).max_col_width(value_width).show(ui, |ui| {
-            for (label, value) in detail_fields(device) {
-                ui.weak(label);
-                ui.add(Label::new(value).wrap());
-                ui.end_row();
-            }
-        });
-        action
-    }
-
-    fn finder_view(&mut self, ui: &mut Ui) {
+    fn finder_view(&mut self, ui: &mut Ui, session: &Session) {
         if ui.button("Back to the list").clicked() {
             self.open_finder(None);
             return;
         }
         ui.add_space(8.0);
-        let Some(device) = self.finder.as_deref().and_then(|id| self.session.get(id)) else {
+        let Some(device) = self.finder.as_deref().and_then(|id| session.get(id)) else {
             ui.label("The device is gone.");
             return;
         };
         ui.heading(device.title().unwrap_or_else(|| "(no name)".into()));
-        if let Some(sig) = self.session.top_signature(device) {
+        if let Some(sig) = session.top_signature(device) {
             ui.label(&sig.name);
         }
         ui.add_space(8.0);
 
-        let FinderReading { stale, percent, label } = FinderReading::of(device);
-        let colour = match percent {
-            _ if stale => ui.visuals().weak_text_color(),
-            70.. => ui.visuals().error_fg_color,
-            40.. => ui.visuals().warn_fg_color,
-            _ => BLUE,
-        };
-        ui.add(ProgressBar::new(percent as f32 / 100.0).desired_height(36.0).fill(colour).text(label));
+        let reading = FinderReading::of(device);
+        let colour = strength_colour(ui.visuals(), &reading);
+        let bar = ProgressBar::new(reading.percent as f32 / 100.0).desired_height(36.0).fill(colour);
+        ui.add(bar.text(reading.label));
         ui.add_space(8.0);
         self.history(ui, colour);
         ui.add_space(8.0);
@@ -371,7 +297,7 @@ impl<'a> Gui<'a> {
             egui::StrokeKind::Inside,
         );
         let step = rect.width() / (FINDER_SAMPLES - 1) as f32;
-        let start = FINDER_SAMPLES - self.finder_history.len();
+        let start = FINDER_SAMPLES.saturating_sub(self.finder_history.len());
         let points = self
             .finder_history
             .iter()
@@ -383,15 +309,15 @@ impl<'a> Gui<'a> {
                 )
             })
             .collect();
-        painter.add(Shape::line(points, Stroke::new(2.0, colour)));
+        painter.add(Shape::line(points, Stroke::new(2.0_f32, colour)));
     }
 
-    fn network_view(&mut self, ui: &mut Ui) {
+    fn network_view(&mut self, ui: &mut Ui, lan: &mut LanState) {
         ui.label("The sweep looks for IP cameras and video recorders on the local network.");
         ui.label("It sends connection attempts to each address. Use it only where you are allowed to.");
         ui.add_space(8.0);
         let mut start = false;
-        match &self.lan {
+        match &*lan {
             LanState::Idle => start = ui.button("Start the sweep").clicked(),
             LanState::Running(since) => {
                 ui.add_enabled(false, Button::new("Start the sweep"));
@@ -414,21 +340,22 @@ impl<'a> Gui<'a> {
             }
         }
         if start {
-            self.start_sweep();
+            *lan = LanState::Running(Instant::now());
+            (self.start_lan)();
         }
     }
 
-    fn followers_view(&mut self, ui: &mut Ui) {
+    fn followers_view(&mut self, ui: &mut Ui, session: &Session) {
         ui.horizontal(|ui| {
             ui.heading("Devices seen at two or more places");
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui.button("Refresh").clicked() {
-                    self.followers = self.session.followers();
+                    self.followers = session.followers();
                 }
             });
         });
         ui.add_space(8.0);
-        if !self.session.has_log() {
+        if !session.has_log() {
             ui.label("The log is off, so there is no history.");
             return;
         }
@@ -468,12 +395,142 @@ enum DeviceAction {
     ToggleKnown,
 }
 
-fn level_colour(ui: &Ui, level: Level) -> Color32 {
+/// Draw the device list. Only the visible rows are laid out, so a long
+/// list in a busy place stays fast. Returns the device that the user
+/// clicked.
+fn device_table(
+    ui: &mut Ui,
+    session: &Session,
+    devices: &[&Device],
+    selected: Option<&str>,
+) -> Option<String> {
+    // Labels that take no clicks, so that a click anywhere in a row selects it.
+    ui.style_mut().interaction.selectable_labels = false;
+    let mut clicked = None;
+    TableBuilder::new(ui)
+        .striped(true)
+        .sense(Sense::click())
+        .cell_layout(Layout::left_to_right(Align::Center))
+        .column(Column::exact(44.0))
+        .column(Column::exact(72.0))
+        .column(Column::initial(220.0).at_least(100.0).clip(true).resizable(true))
+        .column(Column::remainder().at_least(120.0).clip(true))
+        .column(Column::exact(120.0))
+        .column(Column::exact(64.0))
+        .column(Column::exact(40.0))
+        .header(ROW_HEIGHT, |mut header| {
+            for title in ["Level", "Type", "Device", "Finding", "Signal", "Distance", "Seen"] {
+                header.col(|ui| _ = ui.strong(title));
+            }
+        })
+        .body(|body| {
+            body.rows(ROW_HEIGHT, devices.len(), |mut row| {
+                let device = devices[row.index()];
+                row.set_selected(selected == Some(device.advert.id.as_str()));
+                device_row(&mut row, session, device);
+                if row.response().clicked() {
+                    clicked = Some(device.advert.id.clone());
+                }
+            });
+        });
+    clicked
+}
+
+fn device_row(row: &mut TableRow, session: &Session, device: &Device) {
+    let level = session.level(device);
+    let signature = session.top_signature(device);
+    let dim = device.known || device.age() > STALE_AFTER;
+    let text = |text: String| {
+        let text = RichText::new(text);
+        if dim { text.weak() } else { text }
+    };
+
+    let tag = level.map(level_tag).unwrap_or("");
+    row.col(|ui| {
+        ui.label(match level {
+            Some(level) if !dim => RichText::new(tag).strong().color(level_colour(ui.visuals(), level)),
+            _ => text(tag.into()),
+        });
+    });
+    row.col(|ui| _ = ui.label(text(signature.map(|sig| sig.category.label()).unwrap_or("").into())));
+    row.col(|ui| _ = ui.label(text(device.title().unwrap_or_else(|| "(no name)".into()))));
+    row.col(|ui| _ = ui.label(text(finding_text(session, device))));
+    row.col(|ui| {
+        if let Some(rssi) = device.rssi_avg {
+            let bar = ProgressBar::new(signal_percent(rssi) as f32 / 100.0).desired_width(110.0);
+            ui.add(bar.text(format!("{rssi:.0} dBm")));
+        }
+    });
+    row.col(|ui| _ = ui.label(text(device.distance_m().map(format_distance).unwrap_or_default())));
+    row.col(|ui| _ = ui.label(text(format_age(device.age()))));
+}
+
+fn details_pane(ui: &mut Ui, session: &Session, device: &Device) -> Option<DeviceAction> {
+    let mut action = None;
+    ui.horizontal(|ui| {
+        if ui.button("Find this device").clicked() {
+            action = Some(DeviceAction::Find);
+        }
+        let mark = if device.known { "Not my device" } else { "Mark as my device" };
+        if ui.button(mark).clicked() {
+            action = Some(DeviceAction::ToggleKnown);
+        }
+    });
+    ui.add_space(6.0);
+
+    for &index in &device.hits {
+        let sig = session.db().get(index);
+        ui.horizontal_wrapped(|ui| {
+            let colour = level_colour(ui.visuals(), sig.severity);
+            ui.label(RichText::new(level_tag(sig.severity)).strong().color(colour));
+            ui.strong(&sig.name);
+        });
+        ui.weak(format!("Confidence {}; {}", sig.confidence.label(), sig.evidence.describe()));
+        if let Some(notes) = &sig.notes {
+            ui.label(notes);
+        }
+        ui.weak(format!("Source: {}", sig.source));
+        ui.add_space(6.0);
+    }
+    if let Some(follow) = device.follow() {
+        let warning = format!("{} Mark it as your device if it is yours.", follow_warning(follow));
+        ui.colored_label(ui.visuals().warn_fg_color, warning);
+        ui.add_space(6.0);
+    }
+    if device.hits.is_empty() && device.follow().is_none() {
+        ui.weak("No finding for this device.");
+        ui.add_space(6.0);
+    }
+
+    // The value column takes the rest of the panel, and long hex data wraps.
+    let value_width = (ui.available_width() - 100.0).max(120.0);
+    Grid::new("fields").num_columns(2).spacing([12.0, 4.0]).max_col_width(value_width).show(ui, |ui| {
+        for (label, value) in detail_fields(device) {
+            ui.weak(label);
+            ui.add(Label::new(value).wrap());
+            ui.end_row();
+        }
+    });
+    action
+}
+
+fn level_colour(visuals: &Visuals, level: Level) -> Color32 {
     match level {
-        Level::High => ui.visuals().error_fg_color,
-        Level::Medium => ui.visuals().warn_fg_color,
+        Level::High => visuals.error_fg_color,
+        Level::Medium => visuals.warn_fg_color,
         Level::Low => CYAN,
-        Level::Info => ui.visuals().text_color(),
+        Level::Info => visuals.text_color(),
+    }
+}
+
+/// Colour of the finder bar: red when near, yellow, then blue when far,
+/// and grey when the device is silent.
+fn strength_colour(visuals: &Visuals, reading: &FinderReading) -> Color32 {
+    match reading.percent {
+        _ if reading.stale => visuals.weak_text_color(),
+        70.. => visuals.error_fg_color,
+        40.. => visuals.warn_fg_color,
+        _ => BLUE,
     }
 }
 
@@ -526,11 +583,10 @@ fn lan_report(ui: &mut Ui, report: &LanReport, show_all: bool) {
 mod tests {
     use std::cell::Cell;
     use std::net::Ipv4Addr;
-    use std::sync::Arc;
-    use std::sync::mpsc::{self, Sender};
+    use std::sync::mpsc;
 
     use egui_kittest::Harness;
-    use egui_kittest::kittest::Queryable;
+    use egui_kittest::kittest::{NodeT, Queryable};
 
     use super::*;
     use crate::lan::{LanHost, Neighbour, OpenPort};
@@ -569,10 +625,9 @@ mod tests {
 
     fn noop() {}
 
-    /// A window of 1400 × 900 points, with the channel that feeds it.
-    fn harness<'a>(session: Session, start_lan: &'a dyn Fn()) -> (Harness<'a, Gui<'a>>, Sender<AppEvent>) {
-        let (tx, rx) = mpsc::channel();
-        let gui = Gui::new(session, rx, start_lan);
+    /// A window of 1400 × 900 points.
+    fn harness<'a>(session: Session, start_lan: &'a dyn Fn()) -> Harness<'a, Gui<'a>> {
+        let gui = Gui::new(Arc::new(Mutex::new(Live::new(session))), start_lan);
         // A frame time below the tick, so that the harness does not take the
         // repaint request of each tick as an endless animation.
         let mut harness = Harness::builder()
@@ -580,7 +635,13 @@ mod tests {
             .with_step_dt(0.05)
             .build_state(|ctx, gui: &mut Gui| gui.show(ctx), gui);
         harness.run();
-        (harness, tx)
+        harness
+    }
+
+    /// Give one event to the shared state, as the event thread does, and draw.
+    fn deliver(harness: &mut Harness<Gui>, event: AppEvent) {
+        lock(&harness.state().live).on_event(event);
+        harness.run();
     }
 
     fn has(harness: &Harness<Gui>, text: &str) -> bool {
@@ -594,7 +655,7 @@ mod tests {
 
     #[test]
     fn device_view_lists_findings_and_details() {
-        let (mut harness, _tx) = harness(session(), &noop);
+        let mut harness = harness(session(), &noop);
         assert!(has(&harness, "Devices: 4"));
         assert!(has(&harness, "Flagged: 3"));
         assert!(has(&harness, "Place: office"));
@@ -605,13 +666,17 @@ mod tests {
         assert!(has(&harness, "Source: "));
         assert!(has(&harness, "0x01ab"));
 
+        // A click anywhere in a row selects the device.
         click(&mut harness, "Desk lamp");
+        assert_eq!(harness.state().selected.as_deref(), Some("lamp"));
         assert!(has(&harness, "No finding for this device."));
 
-        // Only the flagged devices.
+        // Only the flagged devices. The lamp is gone, so the selection
+        // moves to the first flagged device.
         click(&mut harness, "Show devices without a finding");
         assert!(!harness.state().show_all);
         assert!(!has(&harness, "Desk lamp"));
+        assert_eq!(harness.state().selected.as_deref(), Some("glasses"));
 
         // The phone has no signature, so its details show only the warning.
         click(&mut harness, "My phone");
@@ -621,7 +686,7 @@ mod tests {
 
     #[test]
     fn mark_as_my_device_removes_the_flag() {
-        let (mut harness, _tx) = harness(session(), &noop);
+        let mut harness = harness(session(), &noop);
         click(&mut harness, "Mark as my device");
         assert!(has(&harness, "Flagged: 2"));
         assert!(has(&harness, "known · Meta smart glasses"));
@@ -634,7 +699,7 @@ mod tests {
     #[test]
     fn empty_lists_explain_themselves() {
         let db = Arc::new(SignatureDb::embedded().unwrap());
-        let (mut harness, _tx) = harness(Session::new(db, None, "car".into()), &noop);
+        let mut harness = harness(Session::new(db, None, "car".into()), &noop);
         assert!(has(&harness, "No devices yet."));
         click(&mut harness, "Show devices without a finding");
         assert!(has(&harness, "No flagged devices."));
@@ -645,19 +710,21 @@ mod tests {
 
     #[test]
     fn finder_follows_the_signal() {
-        let (mut harness, _tx) = harness(session(), &noop);
+        let mut harness = harness(session(), &noop);
         click(&mut harness, "My phone");
         click(&mut harness, "Find this device");
         assert_eq!(harness.state().finder.as_deref(), Some("phone"));
         assert!(has(&harness, "Move the laptop slowly."));
 
         // Each tick adds one sample, and the history keeps the latest ones.
-        harness.state_mut().finder_history.extend([0; FINDER_SAMPLES]);
+        harness.state_mut().finder_history = (1..=FINDER_SAMPLES as u16).collect();
         harness.state_mut().last_sample = Instant::now() - TICK;
         harness.run();
-        assert_eq!(harness.state().finder_history.len(), FINDER_SAMPLES);
+        let history = &harness.state().finder_history;
+        assert_eq!(history.len(), FINDER_SAMPLES);
+        assert_eq!(history.front(), Some(&2));
         // -40 dBm is 92 percent.
-        assert_eq!(harness.state().finder_history.back(), Some(&92));
+        assert_eq!(history.back(), Some(&92));
 
         click(&mut harness, "Back to the list");
         assert!(harness.state().finder.is_none());
@@ -668,26 +735,58 @@ mod tests {
     }
 
     #[test]
-    fn finder_colours_follow_the_strength() {
+    fn a_tab_click_leaves_the_finder() {
+        let mut harness = harness(session(), &noop);
+        click(&mut harness, "Find this device");
+        assert_eq!(harness.state().finder.as_deref(), Some("glasses"));
+        // The Bluetooth tab is already selected, and a click still leaves the finder.
+        click(&mut harness, "Bluetooth");
+        assert!(harness.state().finder.is_none());
+        assert!(has(&harness, "Show devices without a finding"));
+    }
+
+    #[test]
+    fn finder_shows_each_strength() {
         let mut session = session();
-        // Silent for 40 s: stale in the finder and dim in the list.
+        // Silent for 10 minutes: stale in the finder.
         let old =
             Advert { id: "old".into(), name: Some("Old tag".into()), rssi: Some(-90), ..Default::default() };
-        session.ingest_at(old, Instant::now() - Duration::from_secs(40));
+        session.ingest_at(old, Instant::now() - Duration::from_secs(600));
         session.ingest(Advert { id: "far".into(), rssi: Some(-85), ..Default::default() });
-        let (mut harness, _tx) = harness(session, &noop);
+        let mut harness = harness(session, &noop);
         for id in ["phone", "glasses", "far", "old"] {
             harness.state_mut().finder = Some(id.into());
             harness.run();
         }
-        assert!(has(&harness, "no signal for 40s"));
+        assert!(has(&harness, "no signal for 10m"));
 
-        // A device that is gone, and a tab change, which closes the finder.
+        // A device that is gone.
         harness.state_mut().finder = Some("gone".into());
         harness.run();
         assert!(has(&harness, "The device is gone."));
-        click(&mut harness, "Followers");
-        assert!(harness.state().finder.is_none());
+    }
+
+    #[test]
+    fn strength_colour_follows_the_bands() {
+        let visuals = Visuals::dark();
+        let colour = |percent, stale| {
+            strength_colour(&visuals, &FinderReading { stale, percent, label: String::new() })
+        };
+        assert_eq!(colour(70, false), visuals.error_fg_color);
+        assert_eq!(colour(69, false), visuals.warn_fg_color);
+        assert_eq!(colour(40, false), visuals.warn_fg_color);
+        assert_eq!(colour(39, false), BLUE);
+        assert_eq!(colour(90, true), visuals.weak_text_color());
+    }
+
+    #[test]
+    fn history_line_survives_a_long_history() {
+        let mut harness = harness(session(), &noop);
+        harness.state_mut().finder = Some("phone".into());
+        // More samples than the history holds must not break the drawing.
+        harness.state_mut().finder_history = vec![50; FINDER_SAMPLES + 2].into();
+        harness.run();
+        assert!(has(&harness, "Move the laptop slowly."));
     }
 
     #[test]
@@ -727,33 +826,55 @@ name_regex = "^InfoTag"
             ..Default::default()
         });
         session.ingest(Advert { id: "info".into(), name: Some("InfoTag".into()), ..Default::default() });
-        let (harness, _tx) = harness(session, &noop);
+        let harness = harness(session, &noop);
         assert!(has(&harness, "Low tag"));
         assert!(has(&harness, "Info tag"));
         assert!(has(&harness, "A note about the low tag."));
+        // The level tags: in the list for both, and in the details for the low tag.
+        assert!(harness.query_all_by_label("low").count() >= 2);
+        assert!(harness.query_all_by_label("info").next().is_some());
+        // The info tag has no signal, so it has no distance either.
+        let distances = harness
+            .query_all_by_label_contains(" m")
+            .filter(|node| node.accesskit_node().value().is_some_and(|text| text.ends_with(" m")));
+        assert_eq!(distances.count(), 1);
     }
 
     #[test]
     fn bluetooth_events_change_the_header() {
-        let (mut harness, tx) = harness(session(), &noop);
+        let mut harness = harness(session(), &noop);
         assert!(has(&harness, "starting"));
-        let mut send = |event: BleEvent, expect: &str| {
-            tx.send(AppEvent::Ble(event)).unwrap();
-            harness.run();
+        let mut check = |event: BleEvent, expect: &str, ok: bool| {
+            deliver(&mut harness, AppEvent::Ble(event));
             assert!(has(&harness, expect), "{expect}");
+            assert_eq!(lock(&harness.state().live).ble_ok, ok, "{expect}");
         };
-        send(BleEvent::Started("hci0".into()), "scanning (hci0)");
-        send(BleEvent::Power(false), "Bluetooth is off");
-        send(BleEvent::Power(true), "scanning");
-        send(
-            BleEvent::Advert(Advert { id: "new".into(), name: Some("New one".into()), ..Default::default() }),
-            "New one",
-        );
-        send(BleEvent::Failed("no adapter".into()), "failed: no adapter");
+        check(BleEvent::Started("hci0".into()), "scanning (hci0)", true);
+        check(BleEvent::Power(false), "Bluetooth is off", false);
+        check(BleEvent::Power(true), "scanning", true);
+        let advert = Advert { id: "new".into(), name: Some("New one".into()), ..Default::default() };
+        check(BleEvent::Advert(advert), "New one", true);
+        check(BleEvent::Failed("no adapter".into()), "failed: no adapter", false);
 
-        harness.state_mut().session.store_error = Some("disk full".into());
+        lock(&harness.state().live).session.store_error = Some("disk full".into());
         harness.run();
         assert!(has(&harness, "Log error: disk full"));
+    }
+
+    #[test]
+    fn pump_gives_each_event_to_the_state_until_the_senders_are_gone() {
+        let db = Arc::new(SignatureDb::embedded().unwrap());
+        let live = Mutex::new(Live::new(Session::new(db, None, "car".into())));
+        let (tx, rx) = mpsc::channel();
+        tx.send(AppEvent::Ble(BleEvent::Started("hci0".into()))).unwrap();
+        tx.send(AppEvent::Ble(BleEvent::Advert(Advert { id: "tag".into(), ..Default::default() }))).unwrap();
+        tx.send(AppEvent::Lan(Err("no network".into()))).unwrap();
+        drop(tx);
+        pump(rx, &live);
+        let live = lock(&live);
+        assert!(live.ble_ok);
+        assert!(live.session.get("tag").is_some());
+        assert!(matches!(&live.lan, LanState::Failed(error) if error == "no network"));
     }
 
     fn report(hosts: Vec<LanHost>) -> LanReport {
@@ -788,18 +909,20 @@ name_regex = "^InfoTag"
     fn network_view_runs_the_sweep_and_shows_the_result() {
         let starts = Cell::new(0);
         let start = || starts.set(starts.get() + 1);
-        let (mut harness, tx) = harness(session(), &start);
+        let mut harness = harness(session(), &start);
         click(&mut harness, "Network cameras");
         click(&mut harness, "Start the sweep");
         assert_eq!(starts.get(), 1);
         assert!(has(&harness, "The sweep runs… 0 s"));
         // The button is off while the sweep runs.
+        assert!(harness.get_by_label("Start the sweep").accesskit_node().is_disabled());
         click(&mut harness, "Start the sweep");
         assert_eq!(starts.get(), 1);
 
-        tx.send(AppEvent::Lan(Ok(report(vec![host(64, Verdict::Likely), host(65, Verdict::Possible)]))))
-            .unwrap();
-        harness.run();
+        deliver(
+            &mut harness,
+            AppEvent::Lan(Ok(report(vec![host(64, Verdict::Likely), host(65, Verdict::Possible)]))),
+        );
         assert!(has(&harness, "253 addresses checked in 5.5 s on 192.168.1.0/24 (en0)."));
         assert!(has(&harness, "2 host(s) with camera evidence. 1 other host(s) answered."));
         assert!(has(&harness, "LIKELY"));
@@ -812,25 +935,25 @@ name_regex = "^InfoTag"
 
         click(&mut harness, "Sweep again");
         assert_eq!(starts.get(), 2);
-        tx.send(AppEvent::Lan(Err("no private IPv4 network found".into()))).unwrap();
-        harness.run();
+        deliver(&mut harness, AppEvent::Lan(Err("no private IPv4 network found".into())));
         assert!(has(&harness, "The sweep failed: no private IPv4 network found"));
         click(&mut harness, "Try again");
         assert_eq!(starts.get(), 3);
 
-        tx.send(AppEvent::Lan(Ok(report(Vec::new())))).unwrap();
-        harness.run();
+        deliver(&mut harness, AppEvent::Lan(Ok(report(Vec::new()))));
         assert!(has(&harness, "No camera evidence found. 1 other host(s) answered."));
     }
 
     #[test]
     fn followers_view_reads_the_log() {
-        let (mut harness, _tx) = harness(session(), &noop);
+        let mut harness = harness(session(), &noop);
         click(&mut harness, "Followers");
         assert!(has(&harness, "same ID"));
         assert!(has(&harness, "home, office"));
         assert!(has(&harness, "id:phone"));
         assert!(!has(&harness, "Desk lamp"));
+        // Refresh reads the log again.
+        harness.state_mut().followers.clear();
         click(&mut harness, "Refresh");
         assert_eq!(harness.state().followers.len(), 1);
     }
@@ -838,12 +961,12 @@ name_regex = "^InfoTag"
     #[test]
     fn followers_view_without_history() {
         let db = Arc::new(SignatureDb::embedded().unwrap());
-        let (mut harness, _tx) = harness(Session::new(db.clone(), None, "car".into()), &noop);
-        click(&mut harness, "Followers");
-        assert!(has(&harness, "The log is off, so there is no history."));
+        let mut without_log = harness(Session::new(db.clone(), None, "car".into()), &noop);
+        click(&mut without_log, "Followers");
+        assert!(has(&without_log, "The log is off, so there is no history."));
 
         let session = Session::new(db, Some(Store::in_memory().unwrap()), "car".into());
-        let (mut with_log, _tx) = self::harness(session, &noop);
+        let mut with_log = harness(session, &noop);
         click(&mut with_log, "Followers");
         assert!(has(&with_log, "No device was seen at two or more places."));
     }

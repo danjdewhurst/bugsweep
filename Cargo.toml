@@ -11,7 +11,7 @@ homepage = "https://github.com/danjdewhurst/bugsweep"
 keywords = ["bluetooth", "privacy", "tracker", "airtag", "surveillance"]
 categories = ["command-line-utilities", "network-programming"]
 rust-version = "1.89"
-include = ["/src", "/data", "/LICENSE", "/README.md", "/CHANGELOG.md"]
+include = ["/src", "/data", "/licenses", "/LICENSE", "/README.md", "/CHANGELOG.md"]
 
 [dependencies]
 anyhow = "1.0.104"
@@ -19,6 +19,7 @@ btleplug = "0.13.5"
 clap = { version = "4.6.7", features = ["derive"] }
 dirs = "7.0.0"
 eframe = "0.33.3"
+egui_extras = "0.33.3"
 futures = "0.3.34"
 hex = "0.4.3"
 if-addrs = "0.15.0"

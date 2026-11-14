@@ -6,6 +6,14 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
+# Unmaintained crates under the desktop window, with no fix in egui 0.33
+# (the newest egui for Rust 1.89). None is a known vulnerability.
+ignore = [
+  { id = "RUSTSEC-2026-0192", reason = "ttf-parser, through egui text layout" },
+  { id = "RUSTSEC-2026-0370", reason = "zvariant, through the Linux screen-reader support of egui" },
+  { id = "RUSTSEC-2026-0371", reason = "zbus_names, through the Linux screen-reader support of egui" },
+  { id = "RUSTSEC-2026-0372", reason = "zvariant_derive, through the Linux screen-reader support of egui" },
+]
 
 [licenses]
 version = 2

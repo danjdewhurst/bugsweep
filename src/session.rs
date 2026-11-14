@@ -218,6 +218,11 @@ impl Session {
         !device.known && self.level(device).is_some_and(|level| level > Level::Info)
     }
 
+    /// The number of flagged devices.
+    pub fn flagged_count(&self) -> usize {
+        self.devices.values().filter(|device| self.is_flagged(device)).count()
+    }
+
     /// Devices in display order: flagged first, then by level, then by signal.
     pub fn sorted(&self, include_unflagged: bool) -> Vec<&Device> {
         let mut list: Vec<&Device> =

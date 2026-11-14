@@ -1,11 +1,12 @@
-//! The real Bluetooth adapter, network and terminal.
+//! The real Bluetooth adapter, network, terminal and window.
 //!
 //! This is the only code that needs a Bluetooth adapter, a network to sweep,
-//! an interactive terminal or a desktop window, so the tests cannot run it and the coverage
-//! check skips this file. Keep each function here short, and put all logic
+//! an interactive terminal or a desktop window, so the tests cannot run it
+//! and the coverage check skips this file. Keep each function here short, and put all logic
 //! in the other modules, where tests reach it through fakes.
 
 use std::sync::mpsc::Receiver;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -18,7 +19,7 @@ use ratatui::crossterm::event::{self, Event, KeyEvent};
 
 use crate::ble::{self, BleEvent, Radio, Signal};
 use crate::cli::Hardware;
-use crate::gui::Gui;
+use crate::gui::{self, Gui, Live};
 use crate::lan::{self, LanReport};
 use crate::model::Advert;
 use crate::session::Session;
@@ -44,7 +45,11 @@ impl Hardware for Machine {
     }
 
     fn window(&self, session: Session, events: Receiver<AppEvent>, start_lan: &dyn Fn()) -> Result<()> {
-        let gui = Gui::new(session, events, start_lan);
+        let live = Arc::new(Mutex::new(Live::new(session)));
+        let pump_live = Arc::clone(&live);
+        // The thread keeps the session current also while the window draws nothing.
+        std::thread::spawn(move || gui::pump(events, &pump_live));
+        let gui = Gui::new(live, start_lan);
         let options = eframe::NativeOptions {
             viewport: eframe::egui::ViewportBuilder::default()
                 .with_title("bugsweep")

@@ -21,8 +21,9 @@ the user's own laptop with no extra hardware.
 
    The binary goes to `~/.local/bin`. Other options: `--version vX.Y.Z`,
    `--dir DIR`. With Rust: `cargo install --locked --git https://github.com/danjdewhurst/bugsweep`.
-3. Never run plain `bugsweep` with no subcommand. That opens a full-screen
-   terminal interface, which an agent cannot drive. Use the subcommands below.
+3. Never run plain `bugsweep` with no subcommand, or `bugsweep gui`. They open
+   a full-screen terminal interface or a desktop window, which an agent cannot
+   drive. Use the subcommands below.
 
 ## Commands for agents
 
