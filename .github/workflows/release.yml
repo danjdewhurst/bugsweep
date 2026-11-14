@@ -58,7 +58,7 @@ jobs:
       - name: Check that Cargo.toml has the tag version
         if: env.TAG != ''
         run: |
-          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          version="$(tr -d '\r' < Cargo.toml | sed -n 's/^version = "\(.*\)"/\1/p' | head -n 1)"
           if [[ "v$version" != "$TAG" ]]; then
             echo "::error::Cargo.toml has $version, but the tag is $TAG"
             exit 1
@@ -70,7 +70,10 @@ jobs:
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
+      # Release binaries are built without a cache, so no cached artefact
+      # from another run can end up in a published build.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: github.event_name == 'pull_request'
         with:
           key: ${{ matrix.target }}
       - name: Build
@@ -93,10 +96,12 @@ jobs:
           fi
           cd dist
           if command -v sha256sum > /dev/null; then
-            sha256sum "$archive" > "$archive.sha256"
+            sum="$(sha256sum "$archive")"
           else
-            shasum -a 256 "$archive" > "$archive.sha256"
+            sum="$(shasum -a 256 "$archive")"
           fi
+          # Git Bash marks binary mode with "*"; use the plain "<hash>  <file>" form.
+          printf '%s  %s\n' "${sum%% *}" "$archive" > "$archive.sha256"
           cat "$archive.sha256"
       - name: Smoke test
         if: matrix.target != 'x86_64-apple-darwin'
@@ -133,12 +138,20 @@ jobs:
           subject-path: |
             dist/*.tar.gz
             dist/*.zip
-      - name: Upload
+      # release-please creates the release as a draft. It becomes public only
+      # after every binary is uploaded, so "latest" always has its assets.
+      - name: Upload and publish
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          if ! gh release view "$TAG" > /dev/null 2>&1; then
-            gh release create "$TAG" --verify-tag --generate-notes --title "$TAG"
+          if ! draft="$(gh release view "$TAG" --json isDraft --jq .isDraft 2> /dev/null)"; then
+            gh release create "$TAG" --draft --verify-tag --generate-notes --title "$TAG"
+            draft=true
+          fi
+          if [[ "$draft" != "true" ]]; then
+            echo "::error::release $TAG is already published; its assets cannot change"
+            exit 1
           fi
           gh release upload "$TAG" dist/*.tar.gz dist/*.zip dist/*.sha256 dist/SHA256SUMS --clobber
+          gh release edit "$TAG" --draft=false --latest

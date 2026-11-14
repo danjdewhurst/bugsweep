@@ -42,7 +42,7 @@ download() { # $1 = URL, $2 = output file
   if command -v curl > /dev/null 2>&1; then
     curl --proto '=https,file' --tlsv1.2 -fsSL --retry 3 -o "$2" "$1"
   elif command -v wget > /dev/null 2>&1; then
-    wget -q -O "$2" "$1"
+    wget -q --https-only -O "$2" "$1"
   else
     die "this script needs curl or wget"
   fi
@@ -66,13 +66,16 @@ detect_target() {
   case "$arch" in
     x86_64 | amd64) arch="x86_64" ;;
     arm64 | aarch64) arch="aarch64" ;;
-    *) die "no prebuilt binary for CPU '$arch'. Build from source: cargo install --git https://github.com/$REPO" ;;
+    *) die "no prebuilt binary for CPU '$arch'. Build from source: cargo install --locked --git https://github.com/$REPO" ;;
   esac
 
   case "$os" in
     Linux)
-      if ldd --version 2>&1 | grep -qi musl; then
-        die "no prebuilt binary for musl libc (Alpine). Build from source: cargo install --git https://github.com/$REPO"
+      # musl's ldd exits 1 after its banner, so do not test the exit status.
+      local libc
+      libc="$(ldd --version 2>&1 || true)"
+      if [[ "$libc" == *musl* ]] || ls /lib/ld-musl-* > /dev/null 2>&1; then
+        die "no prebuilt binary for musl libc (Alpine). Build from source: cargo install --locked --git https://github.com/$REPO"
       fi
       printf '%s-unknown-linux-gnu\n' "$arch"
       ;;
@@ -86,7 +89,7 @@ detect_target() {
     MINGW* | MSYS* | CYGWIN* | Windows_NT)
       die "on Windows, download bugsweep-x86_64-pc-windows-msvc.zip from https://github.com/$REPO/releases"
       ;;
-    *) die "no prebuilt binary for '$os'. Build from source: cargo install --git https://github.com/$REPO" ;;
+    *) die "no prebuilt binary for '$os'. Build from source: cargo install --locked --git https://github.com/$REPO" ;;
   esac
 }
 
@@ -95,6 +98,10 @@ main() {
   local dir="${BUGSWEEP_INSTALL_DIR:-${HOME:?HOME is not set}/.local/bin}"
   local target="${BUGSWEEP_TARGET:-}"
   local base="${BUGSWEEP_DOWNLOAD_URL:-https://github.com/$REPO/releases}"
+  case "$base" in
+    https://* | file://*) ;;
+    *) die "BUGSWEEP_DOWNLOAD_URL must start with https:// or file://" ;;
+  esac
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -144,16 +151,28 @@ main() {
   tar -xzf "$tmp/$name.tar.gz" -C "$tmp"
   [[ -f "$tmp/$name/bugsweep" ]] || die "the archive has no $name/bugsweep"
 
-  mkdir -p "$dir" || die "cannot create $dir"
-  [[ -w "$dir" ]] || die "cannot write to $dir. Use --dir, or run with sudo"
-  # Install by rename, so a running bugsweep keeps its old file.
-  cp "$tmp/$name/bugsweep" "$dir/.bugsweep.new"
-  chmod 755 "$dir/.bugsweep.new"
-  mv -f "$dir/.bugsweep.new" "$dir/bugsweep"
-
+  # Run the new binary before it replaces anything. A missing library or a
+  # glibc that is too old fails here, not after the install.
   local installed
-  installed="$("$dir/bugsweep" --version 2> /dev/null || true)"
-  say "installed ${installed:-bugsweep} to $dir/bugsweep"
+  if ! installed="$("$tmp/$name/bugsweep" --version 2>&1)"; then
+    say "the $target build does not run on this system:"
+    printf '%s\n' "$installed" >&2
+    case "$target" in
+      *linux*) say "the Linux builds need glibc 2.35 or later and libdbus-1 (package libdbus-1-3 or dbus-libs)." ;;
+    esac
+    die "nothing was installed. Build from source: cargo install --locked --git https://github.com/$REPO"
+  fi
+
+  mkdir -p "$dir" 2> /dev/null || die "cannot create $dir. Choose another --dir, or pipe the script to 'sudo bash'"
+  [[ -w "$dir" ]] || die "cannot write to $dir. Choose another --dir, or pipe the script to 'sudo bash'"
+  # Copy to a new temporary file, then rename, so a running bugsweep keeps its old file.
+  local new
+  new="$(mktemp "$dir/.bugsweep.XXXXXX")" || die "cannot write to $dir"
+  cp "$tmp/$name/bugsweep" "$new"
+  chmod 755 "$new"
+  mv -f "$new" "$dir/bugsweep"
+
+  say "installed $installed to $dir/bugsweep"
 
   case ":$PATH:" in
     *":$dir:"*) ;;

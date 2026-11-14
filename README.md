@@ -55,11 +55,15 @@ curl -fsSL https://raw.githubusercontent.com/danjdewhurst/bugsweep/main/install.
 ```
 
 The script picks the right build for your system, checks its SHA-256 sum and
-installs `bugsweep` to `~/.local/bin`. Options:
+installs `bugsweep` to `~/.local/bin`. The Linux builds need glibc 2.35 or
+later (Ubuntu 22.04, Debian 12, Fedora 36 or newer). Options:
 
 ```sh
 # a specific version, into another directory
-curl -fsSL https://raw.githubusercontent.com/danjdewhurst/bugsweep/main/install.sh | bash -s -- --version v0.1.0 --dir /usr/local/bin
+curl -fsSL https://raw.githubusercontent.com/danjdewhurst/bugsweep/main/install.sh | bash -s -- --version v0.1.0 --dir ~/bin
+
+# for all users (needs sudo)
+curl -fsSL https://raw.githubusercontent.com/danjdewhurst/bugsweep/main/install.sh | sudo bash -s -- --dir /usr/local/bin
 ```
 
 **Windows**: download `bugsweep-x86_64-pc-windows-msvc.zip` from the

@@ -8,5 +8,7 @@
       "package-name": "bugsweep",
       "changelog-path": "CHANGELOG.md"
     }
-  }
+  },
+  "draft": true,
+  "force-tag-creation": true
 }

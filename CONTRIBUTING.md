@@ -25,7 +25,8 @@ cargo test
 bash tests/install.sh   # only if you changed install.sh
 ```
 
-CI runs the same checks on Linux, macOS and Windows.
+CI runs clippy and the tests on Linux, macOS and Windows, the format check on
+Linux, and the install-script test on Linux and macOS.
 
 ## Commit messages
 

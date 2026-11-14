@@ -98,5 +98,6 @@ jobs:
       - name: ShellCheck
         if: runner.os == 'Linux'
         run: shellcheck install.sh scripts/*.sh tests/install.sh
+      # /bin/bash is bash 3.2 on macOS: the shell that `curl | bash` gets there.
       - name: Test install.sh against a fake release
-        run: bash tests/install.sh
+        run: /bin/bash tests/install.sh

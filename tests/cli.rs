@@ -36,8 +36,10 @@ fn version_matches_the_package() {
 fn help_lists_each_subcommand() {
     let assert = bugsweep().arg("--help").assert().success();
     let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    // Subcommand lines start with the name; option lines start with "-".
     for command in ["scan", "lan", "followers", "signatures"] {
-        assert!(out.contains(command), "--help does not list {command}:\n{out}");
+        let listed = out.lines().any(|line| line.split_whitespace().next() == Some(command));
+        assert!(listed, "--help does not list {command}:\n{out}");
     }
 }
 
