@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 260" width="960" height="260" role="img" aria-labelledby="title desc">
+  <title id="title">bugsweep</title>
+  <desc id="desc">A radar screen with a bug on it, next to the name bugsweep and the tagline: a radio check for trackers, cameras, recorders and smart glasses.</desc>
+  <defs>
+    <linearGradient id="card" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#071a18"/>
+      <stop offset="1" stop-color="#0b0f14"/>
+    </linearGradient>
+    <pattern id="grid" width="24" height="24" patternUnits="userSpaceOnUse">
+      <path d="M24 0H0V24" fill="none" stroke="#2cf0b0" stroke-opacity="0.06"/>
+    </pattern>
+  </defs>
+  <rect width="960" height="260" rx="20" fill="url(#card)"/>
+  <rect width="960" height="260" rx="20" fill="url(#grid)"/>
+  <rect x="0.75" y="0.75" width="958.5" height="258.5" rx="19.25" fill="none" stroke="#2cf0b0" stroke-opacity="0.25" stroke-width="1.5"/>
+  <svg x="48" y="34" width="192" height="192" viewBox="0 0 128 128">
+  <defs>
+    <radialGradient id="screen" cx="50%" cy="50%" r="50%">
+      <stop offset="0" stop-color="#0f2e2b"/>
+      <stop offset="1" stop-color="#061412"/>
+    </radialGradient>
+    <radialGradient id="glow">
+      <stop offset="0" stop-color="#ff5470" stop-opacity="0.65"/>
+      <stop offset="1" stop-color="#ff5470" stop-opacity="0"/>
+    </radialGradient>
+    <clipPath id="disc">
+      <circle cx="64" cy="64" r="58"/>
+    </clipPath>
+  </defs>
+  <style>
+    .sweep { transform-box: view-box; transform-origin: 64px 64px; animation: spin 4s linear infinite; }
+    .ping { transform-box: fill-box; transform-origin: center; animation: ping 2s ease-out infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    @keyframes ping { from { transform: scale(0.4); opacity: 0.9; } to { transform: scale(1.6); opacity: 0; } }
+    @media (prefers-reduced-motion: reduce) { .sweep, .ping { animation: none; } }
+  </style>
+
+  <!-- screen -->
+  <circle cx="64" cy="64" r="60" fill="url(#screen)"/>
+  <g fill="none" stroke="#2cf0b0" stroke-opacity="0.22" stroke-width="1.25">
+    <circle cx="64" cy="64" r="19"/>
+    <circle cx="64" cy="64" r="38"/>
+    <path d="M64 6v116M6 64h116"/>
+  </g>
+
+  <!-- sweep: a fading wedge that trails the beam -->
+  <g class="sweep" clip-path="url(#disc)">
+    <g fill="#2cf0b0">
+      <path d="M64 64L100.94 16.72A60 60 0 0 1 106.43 21.57Z" fill-opacity="0.42"/>
+      <path d="M64 64L94.90 12.57A60 60 0 0 1 100.94 16.72Z" fill-opacity="0.348"/>
+      <path d="M64 64L88.40 9.19A60 60 0 0 1 94.90 12.57Z" fill-opacity="0.281"/>
+      <path d="M64 64L81.54 6.62A60 60 0 0 1 88.40 9.19Z" fill-opacity="0.22"/>
+      <path d="M64 64L74.42 4.91A60 60 0 0 1 81.54 6.62Z" fill-opacity="0.164"/>
+      <path d="M64 64L67.14 4.08A60 60 0 0 1 74.42 4.91Z" fill-opacity="0.115"/>
+      <path d="M64 64L59.81 4.15A60 60 0 0 1 67.14 4.08Z" fill-opacity="0.072"/>
+      <path d="M64 64L52.55 5.10A60 60 0 0 1 59.81 4.15Z" fill-opacity="0.038"/>
+      <path d="M64 64L45.46 6.94A60 60 0 0 1 52.55 5.10Z" fill-opacity="0.012"/>
+    </g>
+    <line x1="64" y1="64" x2="106.43" y2="21.57" stroke="#2cf0b0" stroke-width="2.5" stroke-linecap="round"/>
+  </g>
+
+  <!-- the bug -->
+  <g transform="translate(86 80) rotate(-30)">
+    <circle r="20" fill="url(#glow)"/>
+    <circle class="ping" r="12" fill="none" stroke="#ff5470" stroke-width="1.5"/>
+    <g stroke="#ff5470" stroke-width="2" stroke-linecap="round" fill="none">
+      <path d="M-5 -3 L-10 -6 M-5 1 L-11 1 M-5 5 L-10 9"/>
+      <path d="M5 -3 L10 -6 M5 1 L11 1 M5 5 L10 9"/>
+      <path d="M-2 -10 L-5 -15 M2 -10 L5 -15"/>
+    </g>
+    <circle cy="-8" r="3.2" fill="#ff5470"/>
+    <ellipse cy="2" rx="6" ry="8" fill="#ff5470"/>
+    <path d="M0 -5 V10" stroke="#3a0a14" stroke-width="1.4" stroke-linecap="round"/>
+  </g>
+
+  <!-- centre and rim -->
+  <circle cx="64" cy="64" r="3.5" fill="#2cf0b0"/>
+  <circle cx="64" cy="64" r="60" fill="none" stroke="#2cf0b0" stroke-opacity="0.85" stroke-width="3"/>
+
+  </svg>
+  <g font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace">
+    <text x="284" y="128" font-size="76" font-weight="700" fill="#e8fff7" letter-spacing="-2">bug<tspan fill="#2cf0b0">sweep</tspan></text>
+    <text x="288" y="170" font-size="21" fill="#9fbfb7">A radio check for trackers, cameras, recorders</text>
+    <text x="288" y="198" font-size="21" fill="#9fbfb7">and smart glasses, on an ordinary laptop.</text>
+  </g>
+</svg>

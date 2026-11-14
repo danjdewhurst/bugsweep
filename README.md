@@ -1,8 +1,38 @@
-# bugsweep
+<p align="center">
+  <img src="assets/banner.svg" alt="bugsweep: a radio check for trackers, cameras, recorders and smart glasses" width="860">
+</p>
 
-A radio check for things that can track, film or record you: location
-trackers, smart glasses, AI recorder pendants, cameras and body cameras.
-It runs on an ordinary laptop, with no extra hardware.
+<p align="center">
+  <a href="https://github.com/danjdewhurst/bugsweep/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/danjdewhurst/bugsweep/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/danjdewhurst/bugsweep/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/danjdewhurst/bugsweep?color=2cf0b0&label=release"></a>
+  <a href="LICENSE"><img alt="MIT licence" src="https://img.shields.io/badge/licence-MIT-2cf0b0"></a>
+  <img alt="Rust 1.89+" src="https://img.shields.io/badge/rust-1.89%2B-orange">
+  <a href="https://skills.sh/danjdewhurst/bugsweep"><img alt="skills.sh" src="https://skills.sh/b/danjdewhurst/bugsweep"></a>
+</p>
+
+<p align="center">
+  <a href="#install">Install</a> ·
+  <a href="#use">Use</a> ·
+  <a href="#what-it-cannot-do">Limits</a> ·
+  <a href="#signatures">Signatures</a> ·
+  <a href="#agent-skills">Agent skills</a> ·
+  <a href="CONTRIBUTING.md">Contribute</a>
+</p>
+
+---
+
+**bugsweep** checks the radio around you for things that can track, film or
+record you: location trackers, smart glasses, AI recorder pendants, cameras
+and body cameras. It runs on an ordinary laptop, with no extra hardware, and
+keeps everything on your machine.
+
+| | It finds | How |
+|---|---|---|
+| 📡 | **Trackers**: AirTag, Find My tags, Samsung SmartTag, Tile, Chipolo, Pebblebee, Google Find Hub and DULT tags | Bluetooth LE frames, with the "away from its owner" state |
+| 🕶️ | **Smart glasses**: Ray-Ban and Oakley Meta, Even Realities, Brilliant Labs, Rokid, Mentra and more | Company IDs, services and names |
+| 🎙️ | **AI recorders**: Plaud, Limitless, Bee, Friend, Omi and more | Company IDs, services and names |
+| 📹 | **Cameras and body cams**: IP cameras, NVRs, GoPro, DJI, Insta360, Axon, WatchGuard | Bluetooth, ONVIF, RTSP, camera ports and adapter makers |
+| 🚶 | **Followers**: a device that turns up at two or more of your places | A local log of sightings |
 
 bugsweep does four jobs with one signature database:
 
@@ -15,6 +45,40 @@ bugsweep does four jobs with one signature database:
 4. **Network camera sweep.** It looks for IP cameras and video recorders on
    the local network (ONVIF discovery, RTSP, vendor ports, and the maker of
    each network adapter).
+
+## Install
+
+**Linux and macOS** (x86_64 and Apple silicon / arm64):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/danjdewhurst/bugsweep/main/install.sh | bash
+```
+
+The script picks the right build for your system, checks its SHA-256 sum and
+installs `bugsweep` to `~/.local/bin`. The Linux builds need glibc 2.35 or
+later (Ubuntu 22.04, Debian 12, Fedora 36 or newer). Options:
+
+```sh
+# a specific version, into another directory
+curl -fsSL https://raw.githubusercontent.com/danjdewhurst/bugsweep/main/install.sh | bash -s -- --version v0.1.0 --dir ~/bin
+
+# for all users (needs sudo)
+curl -fsSL https://raw.githubusercontent.com/danjdewhurst/bugsweep/main/install.sh | sudo bash -s -- --dir /usr/local/bin
+```
+
+**Windows**: download `bugsweep-x86_64-pc-windows-msvc.zip` from the
+[latest release](https://github.com/danjdewhurst/bugsweep/releases/latest).
+
+**From source** (Rust 1.89 or later; on Linux, first install `libdbus-1-dev`
+and `pkg-config`):
+
+```sh
+cargo install --locked --git https://github.com/danjdewhurst/bugsweep
+```
+
+Each release archive has a `.sha256` file and a
+[build provenance attestation](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations).
+Check one with `gh attestation verify <archive> --repo danjdewhurst/bugsweep`.
 
 ## What it cannot do
 
@@ -31,16 +95,22 @@ Many signatures are heuristics. The details pane shows the confidence, the
 kind of evidence and the source of each finding. A finding means "look at
 this", not "this is a bug".
 
+> [!IMPORTANT]
+> If you think that someone tracks you, your safety comes first. Contact local
+> police or a domestic-abuse support service. Record what you find before you
+> remove or disable a tracker.
+
 ## Use
 
 ```sh
-cargo run --release              # terminal interface
-cargo run --release -- scan      # scan for 15 s and print a table
-cargo run --release -- scan --json --seconds 30
-cargo run --release -- lan       # network camera sweep
-cargo run --release -- lan --all # also list hosts without camera evidence
-cargo run --release -- followers # devices seen at two or more places
-cargo run --release -- signatures
+bugsweep                     # terminal interface
+bugsweep scan                # scan for 15 s and print a table
+bugsweep scan --json --seconds 30
+bugsweep scan --flagged      # only devices that need attention
+bugsweep lan                 # network camera sweep
+bugsweep lan --all           # also list hosts without camera evidence
+bugsweep followers           # devices seen at two or more places
+bugsweep signatures          # list the signature database
 ```
 
 Global options: `--place NAME`, `--signatures FILE`, `--db FILE`, `--no-log`.
@@ -119,6 +189,28 @@ cargo run -- --signatures my-signatures.toml scan
 Vendor names come from the public Bluetooth SIG assigned numbers and the IEEE
 registry of MAC address prefixes. Refresh them with `scripts/update-vendors.sh`.
 
+## Agent skills
+
+bugsweep ships [agent skills](https://skills.sh/danjdewhurst/bugsweep) so a
+coding agent (Claude Code, Codex, Cursor, OpenCode and others) knows how to run
+the CLI and read its output:
+
+| Skill | What the agent learns |
+|---|---|
+| [`bugsweep`](skills/bugsweep/SKILL.md) | install bugsweep, run a sweep with `--json`, read the results, and report them with their limits |
+| [`bugsweep-signatures`](skills/bugsweep-signatures/SKILL.md) | write, test and contribute a signature from a Bluetooth capture |
+
+Install them with [skills.sh](https://skills.sh) (needs Node.js):
+
+```sh
+npx skills add danjdewhurst/bugsweep                        # both skills, this project
+npx skills add danjdewhurst/bugsweep --skill bugsweep -g    # one skill, all projects
+npx skills add danjdewhurst/bugsweep -a claude-code         # one agent only
+```
+
+Then ask your agent, for example: "Sweep this room for trackers and hidden
+cameras."
+
 ## Platform notes
 
 - **macOS**: the terminal app needs the Bluetooth permission (System Settings
@@ -126,6 +218,29 @@ registry of MAC address prefixes. Refresh them with `scripts/update-vendors.sh`.
   `address_prefix` do not work there.
 - **Linux**: needs BlueZ. Gives MAC addresses.
 - **Windows**: should work through WinRT. Not tested yet.
+
+## Development
+
+```sh
+cargo fmt --all                          # format
+cargo clippy --all-targets -- -D warnings  # lint
+cargo test                               # unit and CLI tests (no Bluetooth needed)
+bash tests/install.sh                    # test install.sh against a fake release
+```
+
+On Linux, the build needs `libdbus-1-dev` and `pkg-config`. CI runs clippy and
+the tests on Linux, macOS and Windows, the install-script test on Linux and
+macOS, and also checks the format, the minimum Rust version, ShellCheck, and
+[cargo-deny](https://github.com/EmbarkStudios/cargo-deny) licences and advisories.
+
+### Releases
+
+Versions follow [Semantic Versioning](https://semver.org/). Commit messages on
+`main` follow [Conventional Commits](https://www.conventionalcommits.org/)
+(`feat:`, `fix:`, `docs:` …). [release-please](https://github.com/googleapis/release-please)
+turns them into a release PR that bumps the version and updates
+[CHANGELOG.md](CHANGELOG.md). Merging that PR tags the release, and the
+release workflow builds and uploads the binaries.
 
 ## Code map
 
@@ -140,3 +255,19 @@ registry of MAC address prefixes. Refresh them with `scripts/update-vendors.sh`.
 | `src/lan.rs` | network camera sweep |
 | `src/tui.rs` | terminal interface (ratatui) |
 | `src/vendors.rs` | company, service-UUID and MAC-prefix owner names |
+
+## Credits
+
+The signatures build on public work by many people, most of all
+[AirGuard](https://github.com/seemoo-lab/AirGuard) (SEEMOO, TU Darmstadt), the
+Apple Find My and Google Find Hub specifications, the IETF
+[DULT](https://datatracker.ietf.org/wg/dult/about/) drafts,
+[Omi](https://github.com/BasedHardware/omi),
+[all-cameras-are-beacons](https://github.com/soyboi1312/all-cameras-are-beacons)
+and [flock-you](https://github.com/colonelpanichacks/flock-you). The `source`
+field of each signature names its origin. Vendor names come from the Bluetooth
+SIG assigned numbers and the IEEE MA-L registry.
+
+## Licence
+
+[MIT](LICENSE) © Dan Dewhurst

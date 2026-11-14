@@ -1,0 +1,35 @@
+name: New or wrong signature
+description: A device that bugsweep misses, or a false positive.
+labels: [signature]
+body:
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Kind of report
+      options:
+        - bugsweep misses a device
+        - bugsweep flags a harmless device (false positive)
+        - a signature has wrong details
+    validations:
+      required: true
+  - type: input
+    id: device
+    attributes:
+      label: Device
+      description: Maker, model and firmware version if you know it.
+    validations:
+      required: true
+  - type: textarea
+    id: advert
+    attributes:
+      label: Advertisement data
+      description: >-
+        From `bugsweep scan --json`, nRF Connect, btmon or Wireshark: name,
+        company IDs, service UUIDs and the manufacturer or service data bytes.
+        Remove anything that identifies you.
+      render: text
+  - type: textarea
+    id: source
+    attributes:
+      label: Source
+      description: How do you know? A spec, a paper, another project, or your own capture.

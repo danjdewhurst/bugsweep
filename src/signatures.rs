@@ -195,18 +195,10 @@ impl Rule {
     fn compile(raw: RawRule) -> Result<Self> {
         let rule = Rule {
             company_id: raw.company_id,
-            manufacturer_data_prefix: raw
-                .manufacturer_data_prefix
-                .as_deref()
-                .map(parse_hex)
-                .transpose()?,
+            manufacturer_data_prefix: raw.manufacturer_data_prefix.as_deref().map(parse_hex).transpose()?,
             manufacturer_data_byte: raw.manufacturer_data_byte,
             service_uuid: raw.service_uuid.as_deref().map(parse_rule_uuid).transpose()?,
-            service_data_uuid: raw
-                .service_data_uuid
-                .as_deref()
-                .map(parse_rule_uuid)
-                .transpose()?,
+            service_data_uuid: raw.service_data_uuid.as_deref().map(parse_rule_uuid).transpose()?,
             service_data_prefix: raw.service_data_prefix.as_deref().map(parse_hex).transpose()?,
             service_data_byte: raw.service_data_byte,
             name_regex: raw
@@ -217,13 +209,11 @@ impl Rule {
             address_prefix: raw.address_prefix.map(|p| p.to_ascii_uppercase()),
         };
 
-        let needs_company =
-            rule.manufacturer_data_prefix.is_some() || rule.manufacturer_data_byte.is_some();
+        let needs_company = rule.manufacturer_data_prefix.is_some() || rule.manufacturer_data_byte.is_some();
         if needs_company && rule.company_id.is_none() {
             bail!("manufacturer_data conditions need company_id");
         }
-        let needs_service_data =
-            rule.service_data_prefix.is_some() || rule.service_data_byte.is_some();
+        let needs_service_data = rule.service_data_prefix.is_some() || rule.service_data_byte.is_some();
         if needs_service_data && rule.service_data_uuid.is_none() {
             bail!("service_data conditions need service_data_uuid");
         }
@@ -297,8 +287,8 @@ impl SignatureDb {
     }
 
     pub fn from_file(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("cannot read {}", path.display()))?;
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
         Self::parse(&text).with_context(|| format!("signature file {}", path.display()))
     }
 
@@ -440,10 +430,7 @@ mod tests {
     #[test]
     fn google_tracker_frame_types() {
         let db = SignatureDb::embedded().unwrap();
-        assert_eq!(
-            ids(&db, &service_data("feaa", &[0x41, 1, 2, 3])),
-            ["google-fmdn-unwanted-tracking-mode"]
-        );
+        assert_eq!(ids(&db, &service_data("feaa", &[0x41, 1, 2, 3])), ["google-fmdn-unwanted-tracking-mode"]);
         assert_eq!(ids(&db, &service_data("feaa", &[0x40, 1, 2, 3])), ["google-fmdn-tracker"]);
         // An Eddystone URL beacon uses the same UUID and must not match.
         assert!(ids(&db, &service_data("feaa", &[0x10, 1, 2, 3])).is_empty());

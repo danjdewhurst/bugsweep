@@ -315,10 +315,7 @@ fn parse_onvif_answer(xml: &str) -> Option<Onvif> {
     let scopes = element("Scopes").unwrap_or_default();
     let scope = |kind: &str| {
         let marker = format!("onvif://www.onvif.org/{kind}/");
-        scopes
-            .split_whitespace()
-            .find_map(|s| s.strip_prefix(marker.as_str()))
-            .map(percent_decode)
+        scopes.split_whitespace().find_map(|s| s.strip_prefix(marker.as_str())).map(percent_decode)
     };
     Some(Onvif {
         name: scope("name"),
@@ -378,8 +375,7 @@ fn parse_arp(text: &str, table: &mut BTreeMap<Ipv4Addr, String>) {
     )
     .expect("valid pattern");
     for captures in pattern.captures_iter(text) {
-        let (Ok(ip), Some(mac)) = (captures[1].parse::<Ipv4Addr>(), normalise_mac(&captures[2]))
-        else {
+        let (Ok(ip), Some(mac)) = (captures[1].parse::<Ipv4Addr>(), normalise_mac(&captures[2])) else {
             continue;
         };
         if mac != "ff:ff:ff:ff:ff:ff" {
@@ -397,15 +393,12 @@ pub async fn sweep() -> Result<LanReport> {
     }
 
     // ONVIF discovery runs at the same time as the port sweep.
-    let onvif_tasks: Vec<_> =
-        networks.iter().map(|n| tokio::spawn(onvif_discover(n.local))).collect();
+    let onvif_tasks: Vec<_> = networks.iter().map(|n| tokio::spawn(onvif_discover(n.local))).collect();
 
     let addresses: Vec<Ipv4Addr> = networks.iter().flat_map(Network::hosts).collect();
     let addresses_probed = addresses.len();
-    let first_pass: Vec<(Ipv4Addr, u16)> = addresses
-        .iter()
-        .flat_map(|ip| PORTS.iter().map(move |(port, _, _)| (*ip, *port)))
-        .collect();
+    let first_pass: Vec<(Ipv4Addr, u16)> =
+        addresses.iter().flat_map(|ip| PORTS.iter().map(move |(port, _, _)| (*ip, *port))).collect();
     let mut open: BTreeMap<Ipv4Addr, Vec<u16>> = BTreeMap::new();
     for (ip, port) in open_ports(first_pass, CONNECT_TIMEOUT).await {
         open.entry(ip).or_default().push(port);
@@ -414,9 +407,8 @@ pub async fn sweep() -> Result<LanReport> {
     // The first pass made the system ask for the MAC address of each host,
     // so the ARP table now lists every host that answered. Try those hosts
     // again with more time: the first pass can be too fast for them.
-    let in_networks = |ip: &Ipv4Addr| {
-        networks.iter().any(|network| network.contains(*ip) && network.local != *ip)
-    };
+    let in_networks =
+        |ip: &Ipv4Addr| networks.iter().any(|network| network.contains(*ip) && network.local != *ip);
     let alive: Vec<Ipv4Addr> = arp_table().into_keys().filter(in_networks).collect();
     let second_pass: Vec<(Ipv4Addr, u16)> = alive
         .iter()
@@ -434,12 +426,11 @@ pub async fn sweep() -> Result<LanReport> {
         }
     }
 
-    let arp: BTreeMap<Ipv4Addr, String> =
-        arp_table().into_iter().filter(|(ip, _)| in_networks(ip)).collect();
-    let class_of = |ip: &Ipv4Addr| arp.get(ip).and_then(|mac| vendors::mac_vendor(mac)).and_then(vendor_class);
-    let by_vendor = arp
-        .keys()
-        .filter(|ip| matches!(class_of(ip), Some(VendorClass::Camera | VendorClass::Mixed)));
+    let arp: BTreeMap<Ipv4Addr, String> = arp_table().into_iter().filter(|(ip, _)| in_networks(ip)).collect();
+    let class_of =
+        |ip: &Ipv4Addr| arp.get(ip).and_then(|mac| vendors::mac_vendor(mac)).and_then(vendor_class);
+    let by_vendor =
+        arp.keys().filter(|ip| matches!(class_of(ip), Some(VendorClass::Camera | VendorClass::Mixed)));
     let mut ips: Vec<Ipv4Addr> = open.keys().chain(onvif.keys()).chain(by_vendor).copied().collect();
     ips.sort();
     ips.dedup();
@@ -579,7 +570,9 @@ mod tests {
                     let mut buffer = [0u8; 512];
                     // The port check connects and sends nothing, so the read can return 0.
                     if stream.read(&mut buffer).await.unwrap_or(0) > 0 {
-                        let _ = stream.write_all(b"RTSP/1.0 200 OK\r\nCSeq: 1\r\nServer: TestCam/1.0\r\n\r\n").await;
+                        let _ = stream
+                            .write_all(b"RTSP/1.0 200 OK\r\nCSeq: 1\r\nServer: TestCam/1.0\r\n\r\n")
+                            .await;
                     }
                 });
             }
@@ -601,7 +594,8 @@ mod tests {
 
     #[test]
     fn rtsp_answer() {
-        let answer = "RTSP/1.0 200 OK\r\nCSeq: 1\r\nServer: Hipcam RealServer/V1.0\r\nPublic: OPTIONS\r\n\r\n";
+        let answer =
+            "RTSP/1.0 200 OK\r\nCSeq: 1\r\nServer: Hipcam RealServer/V1.0\r\nPublic: OPTIONS\r\n\r\n";
         assert_eq!(parse_rtsp_answer(answer).as_deref(), Some("Hipcam RealServer/V1.0"));
         assert_eq!(parse_rtsp_answer("RTSP/1.0 401 Unauthorized\r\n\r\n").as_deref(), Some("yes"));
         assert_eq!(parse_rtsp_answer("HTTP/1.1 400 Bad Request\r\n\r\n"), None);

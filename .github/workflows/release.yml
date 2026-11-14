@@ -1,0 +1,159 @@
+name: Release binaries
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Release tag, for example v0.1.0
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build and upload, for example v0.1.0
+        required: true
+        type: string
+  # Build (but do not publish) when the release pipeline changes.
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - Cargo.toml
+      - Cargo.lock
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  TAG: ${{ inputs.tag }}
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04 }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm }
+          - { target: x86_64-apple-darwin, os: macos-latest }
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check the tag
+        if: env.TAG != ''
+        run: |
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::bad tag: $TAG"
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag || github.sha }}
+          persist-credentials: false
+      - name: Check that Cargo.toml has the tag version
+        if: env.TAG != ''
+        run: |
+          version="$(tr -d '\r' < Cargo.toml | sed -n 's/^version = "\(.*\)"/\1/p' | head -n 1)"
+          if [[ "v$version" != "$TAG" ]]; then
+            echo "::error::Cargo.toml has $version, but the tag is $TAG"
+            exit 1
+          fi
+      - name: Install BlueZ headers
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      # Release binaries are built without a cache, so no cached artefact
+      # from another run can end up in a published build.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: github.event_name == 'pull_request'
+        with:
+          key: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          name="bugsweep-$TARGET"
+          mkdir -p "dist/$name"
+          cp README.md LICENSE CHANGELOG.md "dist/$name/"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            cp "target/$TARGET/release/bugsweep.exe" "dist/$name/"
+            archive="$name.zip"
+            (cd dist && 7z a -tzip "$archive" "$name" > /dev/null)
+          else
+            cp "target/$TARGET/release/bugsweep" "dist/$name/"
+            archive="$name.tar.gz"
+            tar -C dist -czf "dist/$archive" "$name"
+          fi
+          cd dist
+          if command -v sha256sum > /dev/null; then
+            sum="$(sha256sum "$archive")"
+          else
+            sum="$(shasum -a 256 "$archive")"
+          fi
+          # Git Bash marks binary mode with "*"; use the plain "<hash>  <file>" form.
+          printf '%s  %s\n' "${sum%% *}" "$archive" > "$archive.sha256"
+          cat "$archive.sha256"
+      - name: Smoke test
+        if: matrix.target != 'x86_64-apple-darwin'
+        run: target/${{ matrix.target }}/release/bugsweep --version
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bugsweep-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Upload to the GitHub release
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          pattern: bugsweep-*
+          merge-multiple: true
+      - name: Write SHA256SUMS
+        working-directory: dist
+        run: cat ./*.sha256 | sort -k 2 > SHA256SUMS && cat SHA256SUMS
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
+      # release-please creates the release as a draft. It becomes public only
+      # after every binary is uploaded, so "latest" always has its assets.
+      - name: Upload and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if ! draft="$(gh release view "$TAG" --json isDraft --jq .isDraft 2> /dev/null)"; then
+            gh release create "$TAG" --draft --verify-tag --generate-notes --title "$TAG"
+            draft=true
+          fi
+          if [[ "$draft" != "true" ]]; then
+            echo "::error::release $TAG is already published; its assets cannot change"
+            exit 1
+          fi
+          gh release upload "$TAG" dist/*.tar.gz dist/*.zip dist/*.sha256 dist/SHA256SUMS --clobber
+          # "legacy" marks the release as latest only if it has the highest version.
+          id="$(gh release view "$TAG" --json databaseId --jq .databaseId)"
+          gh api -X PATCH "repos/$GH_REPO/releases/$id" -F draft=false -f make_latest=legacy > /dev/null

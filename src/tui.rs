@@ -9,15 +9,13 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    Block, Cell, Gauge, Paragraph, Row, Sparkline, Table, TableState, Tabs, Wrap,
-};
+use ratatui::widgets::{Block, Cell, Gauge, Paragraph, Row, Sparkline, Table, TableState, Tabs, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 
 use crate::ble::BleEvent;
 use crate::lan::{LanHost, LanReport, Verdict};
-use crate::session::follow_text;
 use crate::model::uuid_label;
+use crate::session::follow_text;
 use crate::session::{Device, Session};
 use crate::signatures::Level;
 use crate::store::Follower;
@@ -274,7 +272,9 @@ impl<'a> App<'a> {
             "f/Esc leave the finder"
         } else {
             match self.view {
-                View::Devices => "↑↓ select   f finder   m mark as known   a all/flagged only   Tab view   q quit",
+                View::Devices => {
+                    "↑↓ select   f finder   m mark as known   a all/flagged only   Tab view   q quit"
+                }
                 View::Network => "l start the sweep   a all hosts/camera evidence only   Tab view   q quit",
                 View::Followers => "Tab view   q quit",
             }
@@ -379,12 +379,8 @@ impl<'a> App<'a> {
             lines.push(Line::from(vec![
                 Span::styled(format!("{} ", level_tag(sig.severity)), level_style(Some(sig.severity))),
                 Span::from(sig.name.clone()).bold(),
-                Span::from(format!(
-                    "  (confidence {}; {})",
-                    sig.confidence.label(),
-                    sig.evidence.describe()
-                ))
-                .dim(),
+                Span::from(format!("  (confidence {}; {})", sig.confidence.label(), sig.evidence.describe()))
+                    .dim(),
             ]));
             if let Some(notes) = &sig.notes {
                 lines.push(Line::from(format!("     {notes}")));
@@ -456,12 +452,8 @@ impl<'a> App<'a> {
         .areas(inner);
 
         let name = device.title().unwrap_or_else(|| "(no name)".into());
-        let finding =
-            self.session.top_signature(device).map(|sig| sig.name.clone()).unwrap_or_default();
-        frame.render_widget(
-            Paragraph::new(vec![Line::from(name).bold(), Line::from(finding)]),
-            title,
-        );
+        let finding = self.session.top_signature(device).map(|sig| sig.name.clone()).unwrap_or_default();
+        frame.render_widget(Paragraph::new(vec![Line::from(name).bold(), Line::from(finding)]), title);
 
         let stale = device.age() > Duration::from_secs(5);
         let percent = device.rssi_avg.map(signal_percent).unwrap_or(0);
@@ -488,8 +480,7 @@ impl<'a> App<'a> {
         );
 
         let width = history.width as usize;
-        let samples: Vec<u64> =
-            self.finder_history.iter().rev().take(width).rev().copied().collect();
+        let samples: Vec<u64> = self.finder_history.iter().rev().take(width).rev().copied().collect();
         frame.render_widget(
             Sparkline::default().data(&samples).max(100).style(Style::new().fg(colour)),
             history,
@@ -509,7 +500,9 @@ impl<'a> App<'a> {
         let intro = |extra: Vec<Line<'static>>| {
             let mut lines = vec![
                 Line::from("The sweep looks for IP cameras and video recorders on the local network."),
-                Line::from("It sends connection attempts to each address. Use it only where you are allowed to."),
+                Line::from(
+                    "It sends connection attempts to each address. Use it only where you are allowed to.",
+                ),
                 Line::from(""),
             ];
             lines.extend(extra);
@@ -521,11 +514,9 @@ impl<'a> App<'a> {
                 frame.render_widget(text.block(block), area);
             }
             LanState::Running(since) => {
-                let text = intro(vec![Line::from(format!(
-                    "The sweep runs… {} s",
-                    since.elapsed().as_secs()
-                ))
-                .yellow()]);
+                let text = intro(vec![
+                    Line::from(format!("The sweep runs… {} s", since.elapsed().as_secs())).yellow(),
+                ]);
                 frame.render_widget(text.block(block), area);
             }
             LanState::Failed(error) => {
@@ -738,11 +729,7 @@ pub fn lan_evidence(host: &LanHost) -> String {
         });
     }
     if let Some(rtsp) = &host.rtsp {
-        parts.push(if rtsp == "yes" {
-            "RTSP server".to_string()
-        } else {
-            format!("RTSP server: {rtsp}")
-        });
+        parts.push(if rtsp == "yes" { "RTSP server".to_string() } else { format!("RTSP server: {rtsp}") });
     }
     for port in &host.open_ports {
         parts.push(format!("port {} ({})", port.port, port.meaning));
@@ -783,11 +770,19 @@ mod tests {
         glasses.manufacturer_data.insert(0x01AB, vec![1, 2, 3]);
         session.ingest(glasses);
 
-        let phone =
-            Advert { id: "phone".into(), name: Some("My phone".into()), rssi: Some(-40), ..Default::default() };
+        let phone = Advert {
+            id: "phone".into(),
+            name: Some("My phone".into()),
+            rssi: Some(-40),
+            ..Default::default()
+        };
         session.ingest(phone);
-        let lamp =
-            Advert { id: "lamp".into(), name: Some("Desk lamp".into()), rssi: Some(-60), ..Default::default() };
+        let lamp = Advert {
+            id: "lamp".into(),
+            name: Some("Desk lamp".into()),
+            rssi: Some(-60),
+            ..Default::default()
+        };
         session.ingest(lamp);
         session
     }
@@ -812,7 +807,10 @@ mod tests {
         let mut app = App::new(session(), &noop);
         let screen = render(&mut app);
         let row = |needle: &str| {
-            screen.lines().position(|l| l.contains(needle)).unwrap_or_else(|| panic!("{needle} missing:\n{screen}"))
+            screen
+                .lines()
+                .position(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} missing:\n{screen}"))
         };
         // High first, then medium findings by signal, then devices without a finding.
         assert!(row("Meta smart glasses") < row("Tile tracker"));
