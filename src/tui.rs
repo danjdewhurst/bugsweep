@@ -6,7 +6,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use ratatui::backend::Backend;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
@@ -64,23 +64,20 @@ struct App<'a> {
     followers: Vec<Follower>,
 }
 
-/// Run the interface until the user quits. `start_lan` starts one network
-/// sweep, whose result must arrive as `AppEvent::Lan`.
-pub fn run(session: Session, events: Receiver<AppEvent>, start_lan: &dyn Fn()) -> Result<()> {
-    let mut terminal = ratatui::init();
-    let result = App::new(session, start_lan).event_loop(&mut terminal, events, &mut read_key);
-    ratatui::restore();
-    result
-}
-
-/// Wait up to `wait` for one key event from the real terminal.
-fn read_key(wait: Duration) -> Result<Option<KeyEvent>> {
-    if event::poll(wait)?
-        && let Event::Key(key) = event::read()?
-    {
-        return Ok(Some(key));
-    }
-    Ok(None)
+/// Run the interface on `terminal` until the user quits. `start_lan` starts
+/// one network sweep, whose result must arrive as `AppEvent::Lan`.
+/// `next_key` waits up to the given time for one key event.
+pub(crate) fn run<B: Backend>(
+    terminal: &mut Terminal<B>,
+    session: Session,
+    events: Receiver<AppEvent>,
+    start_lan: &dyn Fn(),
+    next_key: &mut dyn FnMut(Duration) -> Result<Option<KeyEvent>>,
+) -> Result<()>
+where
+    B::Error: Send + Sync + 'static,
+{
+    App::new(session, start_lan).event_loop(terminal, events, next_key)
 }
 
 impl<'a> App<'a> {
@@ -981,6 +978,14 @@ mod tests {
         assert!(app.session.get("new").is_some());
         assert!(screen.contains("scanning (hci0)"), "{screen}");
         assert!(screen.contains("Press l to start the sweep."), "{screen}");
+    }
+
+    #[test]
+    fn run_quits_on_q() {
+        let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        let (_tx, rx) = std::sync::mpsc::channel();
+        run(&mut terminal, session(), rx, &noop, &mut |_| Ok(press(KeyCode::Char('q')))).unwrap();
+        assert!(screen_of(&terminal).contains("1 Bluetooth"));
     }
 
     #[test]

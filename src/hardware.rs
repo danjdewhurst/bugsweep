@@ -6,6 +6,7 @@
 //! in the other modules, where tests reach it through fakes.
 
 use std::sync::mpsc::Receiver;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use btleplug::api::{Central, CentralEvent, CentralState, Manager as _, Peripheral as _, ScanFilter};
@@ -13,6 +14,7 @@ use btleplug::platform::{Adapter, Manager, PeripheralId};
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use futures::{FutureExt, StreamExt};
+use ratatui::crossterm::event::{self, Event, KeyEvent};
 
 use crate::ble::{self, BleEvent, Radio, Signal};
 use crate::cli::Hardware;
@@ -34,8 +36,21 @@ impl Hardware for Machine {
     }
 
     fn terminal(&self, session: Session, events: Receiver<AppEvent>, start_lan: &dyn Fn()) -> Result<()> {
-        tui::run(session, events, start_lan)
+        let mut terminal = ratatui::init();
+        let result = tui::run(&mut terminal, session, events, start_lan, &mut read_key);
+        ratatui::restore();
+        result
     }
+}
+
+/// Wait up to `wait` for one key event from the real terminal.
+fn read_key(wait: Duration) -> Result<Option<KeyEvent>> {
+    if event::poll(wait)?
+        && let Event::Key(key) = event::read()?
+    {
+        return Ok(Some(key));
+    }
+    Ok(None)
 }
 
 /// The first Bluetooth adapter of this machine.

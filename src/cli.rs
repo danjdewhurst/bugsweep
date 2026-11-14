@@ -94,13 +94,9 @@ pub struct Output<'a> {
 }
 
 /// Parse the arguments and run the command. A parse error, `--help` and
-/// `--version` end the process, as clap does.
-pub fn run<T: Into<OsString> + Clone>(
-    args: impl IntoIterator<Item = T>,
-    hardware: &dyn Hardware,
-    io: Output,
-) -> Result<()> {
-    let cli = Cli::try_parse_from(args).unwrap_or_else(|error| error.exit());
+/// `--version` come back as a [`clap::Error`].
+pub fn run(args: Vec<OsString>, hardware: &dyn Hardware, io: Output) -> Result<()> {
+    let cli = Cli::try_parse_from(args)?;
     let db = Arc::new(match &cli.signatures {
         Some(path) => SignatureDb::from_file(path)?,
         None => SignatureDb::embedded()?,
@@ -446,11 +442,14 @@ mod tests {
         }
     }
 
+    fn command_line(args: &[&str]) -> Vec<OsString> {
+        std::iter::once("bugsweep").chain(args.iter().copied()).map(OsString::from).collect()
+    }
+
     /// Run a command and return its standard output and standard error.
     fn run_with(hardware: &Fake, args: &[&str]) -> Result<(String, String)> {
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let args = std::iter::once("bugsweep").chain(args.iter().copied());
-        run(args, hardware, Output { out: &mut out, err: &mut err })?;
+        run(command_line(args), hardware, Output { out: &mut out, err: &mut err })?;
         Ok((String::from_utf8(out).unwrap(), String::from_utf8(err).unwrap()))
     }
 
@@ -684,6 +683,32 @@ mod tests {
     }
 
     #[test]
+    fn signature_file_replaces_the_built_in_database() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("custom.toml");
+        std::fs::write(
+            &path,
+            "[[signature]]\nid = \"test-tag\"\nname = \"Test tag\"\ncategory = \"tracker\"\n\
+             severity = \"high\"\nconfidence = \"low\"\nevidence = \"guess\"\nsource = \"test\"\n\
+             [[signature.match]]\nname_regex = \"^TestTag\"\n",
+        )
+        .unwrap();
+        let path = path.display().to_string();
+        let (out, _) = run_with(&Fake::new(Vec::new), &["--signatures", &path, "signatures"]).unwrap();
+        assert_eq!(out.lines().count(), 2, "{out}");
+        assert!(out.contains("test-tag"), "{out}");
+        let missing = dir.path().join("missing.toml").display().to_string();
+        assert!(run_with(&Fake::new(Vec::new), &["--signatures", &missing, "signatures"]).is_err());
+    }
+
+    #[test]
+    fn parse_errors_are_clap_errors() {
+        let error = run_with(&Fake::new(Vec::new), &["--version"]).unwrap_err();
+        let error = error.downcast_ref::<clap::Error>().unwrap();
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
+    }
+
+    #[test]
     fn signatures_and_log_switches() {
         let (out, _) = run_with(&Fake::new(Vec::new), &["signatures"]).unwrap();
         assert!(out.contains("apple-airtag-separated"));
@@ -707,8 +732,7 @@ mod tests {
                 } else {
                     Output { out: &mut other, err: &mut full }
                 };
-                let line = std::iter::once("bugsweep").chain(args.iter().copied());
-                let error = run(line, fake, io).unwrap_err();
+                let error = run(command_line(args), fake, io).unwrap_err();
                 let kind = error.downcast_ref::<std::io::Error>().map(std::io::Error::kind);
                 assert_eq!(kind, Some(std::io::ErrorKind::WriteZero), "{args:?} at {at}: {error}");
             }
