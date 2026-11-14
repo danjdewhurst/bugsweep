@@ -835,7 +835,7 @@ name_regex = "^InfoTag"
             ..Default::default()
         });
         session.ingest(Advert { id: "info".into(), name: Some("InfoTag".into()), ..Default::default() });
-        let harness = harness(session, &noop);
+        let mut harness = harness(session, &noop);
         assert!(has(&harness, "Low tag"));
         assert!(has(&harness, "Info tag"));
         assert!(has(&harness, "A note about the low tag."));
@@ -847,6 +847,12 @@ name_regex = "^InfoTag"
             .query_all_by_label_contains(" m")
             .filter(|node| node.accesskit_node().value().is_some_and(|text| text.ends_with(" m")));
         assert_eq!(distances.count(), 1);
+
+        // The details of a signature without notes.
+        click(&mut harness, "InfoTag");
+        assert_eq!(harness.state().selected.as_deref(), Some("info"));
+        assert!(!has(&harness, "A note about the low tag."));
+        assert!(has(&harness, "Source: test"));
     }
 
     #[test]
