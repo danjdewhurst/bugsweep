@@ -13,6 +13,10 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # Wait a week before taking a new action release, so a bad release
+    # can be found and pulled first.
+    cooldown:
+      default-days: 7
     commit-message:
       prefix: "ci"
     groups:

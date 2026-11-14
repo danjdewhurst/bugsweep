@@ -14,7 +14,9 @@ signatures, most of all rules that were checked against a real device.
    cargo test
    ```
 
-The tests need no Bluetooth adapter and no network.
+The tests need no Bluetooth adapter and send nothing to the network. Some
+tests read the network state of the machine (interfaces, ARP table, default
+route) and use local sockets on 127.0.0.1.
 
 ## Before you open a pull request
 
@@ -36,8 +38,10 @@ the tool with `cargo install cargo-llvm-cov` (or `brew install cargo-llvm-cov`)
 and `rustup component add llvm-tools-preview`.
 
 The coverage check skips one file: `src/hardware.rs`. It holds the only code
-that needs a Bluetooth adapter, a network to sweep or an interactive terminal.
-Keep each function there short. Put logic in the other modules, where tests
+that needs a Bluetooth adapter, a network to sweep or an interactive terminal:
+the btleplug calls and their event mapping, the real sweep, and the terminal
+setup and key reader. No test checks that code, so keep each function there
+short and plain. Put logic in the other modules, where tests
 reach it through fakes: `cli::Hardware`, `ble::Radio`, `lan::Probe` and the
 command runner in `place.rs`.
 

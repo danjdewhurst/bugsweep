@@ -195,13 +195,12 @@ fn run_scan(
     flagged_only: bool,
     io: Output,
 ) -> Result<()> {
-    let runtime = runtime()?;
-    let (tx, rx) = mpsc::channel::<BleEvent>();
-    runtime.spawn(hardware.ble(Box::new(move |event| tx.send(event).is_ok())));
-
     if !as_json {
         writeln!(io.err, "Scanning Bluetooth for {seconds} s at place {:?}…", session.place)?;
     }
+    let runtime = runtime()?;
+    let (tx, rx) = mpsc::channel::<BleEvent>();
+    runtime.spawn(hardware.ble(Box::new(move |event| tx.send(event).is_ok())));
     let failure = collect(&mut session, &rx, Instant::now() + Duration::from_secs(seconds));
     drop(rx);
     runtime.shutdown_timeout(Duration::from_millis(300));
@@ -397,6 +396,9 @@ mod tests {
     /// A machine that the tests control.
     struct Fake {
         ble: fn() -> Vec<BleEvent>,
+        /// After the events, send adverts until the receiver stops, as a
+        /// real radio in a busy room does.
+        endless: bool,
         lan: fn() -> Result<LanReport>,
         /// What the fake terminal received.
         seen: Mutex<Vec<String>>,
@@ -404,7 +406,12 @@ mod tests {
 
     impl Fake {
         fn new(ble: fn() -> Vec<BleEvent>) -> Self {
-            Fake { ble, lan: || Ok(report(Vec::new(), Vec::new())), seen: Mutex::new(Vec::new()) }
+            Fake {
+                ble,
+                endless: false,
+                lan: || Ok(report(Vec::new(), Vec::new())),
+                seen: Mutex::new(Vec::new()),
+            }
         }
     }
 
@@ -421,8 +428,14 @@ mod tests {
 
     impl Hardware for Fake {
         fn ble(&self, emit: Box<dyn Fn(BleEvent) -> bool + Send + Sync>) -> BoxFuture<'static, ()> {
-            let events = (self.ble)();
-            async move { events.into_iter().for_each(|event| _ = emit(event)) }.boxed()
+            let (events, endless) = ((self.ble)(), self.endless);
+            async move {
+                events.into_iter().for_each(|event| _ = emit(event));
+                while endless && emit(BleEvent::Advert(advert("busy", None, Some(-70)))) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+            .boxed()
         }
 
         fn lan(&self) -> BoxFuture<'static, Result<LanReport>> {
@@ -434,7 +447,10 @@ mod tests {
         fn terminal(&self, session: Session, events: Receiver<AppEvent>, start_lan: &dyn Fn()) -> Result<()> {
             start_lan();
             let count = (self.ble)().len() + 1;
-            let mut seen: Vec<String> = events.iter().take(count).map(describe).collect();
+            // A missing event fails the test and does not hang it.
+            let wait = Duration::from_secs(10);
+            let mut seen: Vec<String> =
+                (0..count).map(|_| describe(events.recv_timeout(wait).expect("an event"))).collect();
             seen.sort();
             seen.push(format!("place {}", session.place));
             *self.seen.lock().unwrap() = seen;
@@ -537,6 +553,16 @@ mod tests {
         assert_eq!(tag["findings"][0], "apple-airtag-separated");
         assert_eq!(tag["company_ids"][0], "0x004c");
         assert_eq!(tag["services"][0], tag["service_data"][0]);
+    }
+
+    #[test]
+    fn scan_ends_at_the_deadline_while_devices_still_send() {
+        let busy = Fake { endless: true, ..Fake::new(Vec::new) };
+        let started = Instant::now();
+        let (out, err) = run_with(&busy, &["--no-log", "--place", "x", "scan", "-s", "1"]).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        assert!(out.contains("(no name)"), "{out}");
+        assert!(err.contains("1 device(s), 0 flagged."), "{err}");
     }
 
     #[test]
@@ -679,7 +705,9 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("name:Bob  (no name)  -  same name"), "{out}");
-        assert!(out.contains("first seen 0s ago, last seen 0s ago"), "{out}");
+        // The clock can pass a second boundary while the test runs.
+        let ages = ["0s ago, last seen 0s ago", "1s ago, last seen 1s ago", "1s ago, last seen 0s ago"];
+        assert!(ages.iter().any(|age| out.contains(&format!("first seen {age}"))), "{out}");
     }
 
     #[test]

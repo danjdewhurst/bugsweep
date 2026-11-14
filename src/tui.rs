@@ -1211,7 +1211,7 @@ mod tests {
         assert!(text.contains("aa:bb:cc:dd:ee:ff  (full)"), "{text}");
         assert!(text.contains("0xfffe unknown company: "), "{text}");
         assert!(text.contains("… (30 bytes)"), "{text}");
-        assert!(text.contains("feed (Tile, Inc.)") || text.contains("(Tile"), "{text}");
+        assert!(text.contains("feed (Tile, Inc.)"), "{text}");
         assert!(text.contains("12345678-1234-1234-1234-123456789abc"), "{text}");
         assert!(text.contains("Svc data"), "{text}");
         assert!(text.contains("TX power -8 dBm"), "{text}");
@@ -1220,6 +1220,21 @@ mod tests {
         let text = text_of(&app.detail_lines(lamp));
         assert!(text.contains("No finding for this device."), "{text}");
         assert!(text.contains("the system hides the address"), "{text}");
+    }
+
+    #[test]
+    fn details_of_a_signature_without_notes() {
+        let mut session = session();
+        let mut advert = Advert { id: "quest".into(), ..Default::default() };
+        advert.manufacturer_data.insert(0x058E, vec![1]);
+        session.ingest(advert);
+        let app = App::new(session, &noop);
+        let text = text_of(&app.detail_lines(app.session.get("quest").unwrap()));
+        let lines: Vec<&str> = text.lines().collect();
+        let name =
+            lines.iter().position(|line| line.contains("Meta device (glasses or Quest headset)")).unwrap();
+        // The source follows the name at once, because there are no notes.
+        assert!(lines[name + 1].trim_start().starts_with("Source: Company IDs 0x058E"), "{text}");
     }
 
     #[test]

@@ -366,6 +366,14 @@ mod tests {
     }
 
     #[test]
+    fn a_new_name_replaces_the_old_name() {
+        let mut session = session();
+        session.ingest(named("a", "Thing"));
+        session.ingest(named("a", "Other thing"));
+        assert_eq!(session.get("a").unwrap().advert.name.as_deref(), Some("Other thing"));
+    }
+
+    #[test]
     fn same_id_at_another_place_is_a_follower() {
         let store = Store::in_memory().unwrap();
         store.record("id:phone", "home", Some(-50), None, None).unwrap();

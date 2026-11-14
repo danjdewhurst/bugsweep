@@ -178,11 +178,13 @@ mod tests {
         assert_eq!(seen, ["started fake adapter"]);
         assert!(stopped);
 
-        let (seen, _) = record(radio(signals()), |event| !matches!(event, BleEvent::Power(_))).await;
+        let (seen, stopped) = record(radio(signals()), |event| !matches!(event, BleEvent::Power(_))).await;
         assert_eq!(seen, ["started fake adapter", "power true"]);
+        assert!(stopped);
 
-        let (seen, _) = record(radio(signals()), |event| !matches!(event, BleEvent::Advert(_))).await;
+        let (seen, stopped) = record(radio(signals()), |event| !matches!(event, BleEvent::Advert(_))).await;
         assert_eq!(seen, ["started fake adapter", "power true", "advert 7"]);
+        assert!(stopped);
     }
 
     #[tokio::test]

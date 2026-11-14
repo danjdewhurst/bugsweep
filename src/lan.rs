@@ -338,14 +338,18 @@ async fn onvif_discover(local: Ipv4Addr, target: SocketAddr, wait: Duration) -> 
     }
     let deadline = Instant::now() + wait;
     let mut buffer = vec![0u8; 16 * 1024];
-    // The socket is IPv4, so each answer comes from an IPv4 address.
-    while let Ok(Ok((read, SocketAddr::V4(from)))) =
-        timeout(deadline.saturating_duration_since(Instant::now()), socket.recv_from(&mut buffer)).await
+    // Check the time before each read: a host that never stops sending must
+    // not keep the sweep alive. The socket is IPv4, so each answer comes
+    // from an IPv4 address.
+    let mut left = wait;
+    while !left.is_zero()
+        && let Ok(Ok((read, SocketAddr::V4(from)))) = timeout(left, socket.recv_from(&mut buffer)).await
     {
         let xml = String::from_utf8_lossy(&buffer[..read]);
         if let Some(onvif) = parse_onvif_answer(&xml) {
             found.entry(*from.ip()).or_insert(onvif);
         }
+        left = deadline.saturating_duration_since(Instant::now());
     }
     found
 }
@@ -390,7 +394,14 @@ pub(crate) trait Probe {
 }
 
 /// The real network of this machine.
-pub(crate) struct System;
+pub(crate) struct System {
+    /// Where the ONVIF probe goes, and how long to wait for answers.
+    onvif_target: SocketAddr,
+    onvif_wait: Duration,
+}
+
+/// This machine, with the ONVIF probe to the WS-Discovery multicast group.
+pub(crate) const MACHINE: System = System { onvif_target: ONVIF_TARGET, onvif_wait: ONVIF_WAIT };
 
 impl Probe for System {
     fn networks(&self) -> Result<Vec<Network>> {
@@ -406,7 +417,7 @@ impl Probe for System {
     }
 
     async fn onvif(&self, local: Ipv4Addr) -> BTreeMap<Ipv4Addr, Onvif> {
-        onvif_discover(local, ONVIF_TARGET, ONVIF_WAIT).await
+        onvif_discover(local, self.onvif_target, self.onvif_wait).await
     }
 
     async fn rtsp(&self, ip: Ipv4Addr, port: u16) -> Option<String> {
@@ -617,9 +628,9 @@ mod tests {
         assert!(!port_is_open(ip, closed_port, CONNECT_TIMEOUT).await);
         assert_eq!(rtsp_probe(ip, closed_port).await, None);
 
-        let found = System.open_ports(vec![(ip, port), (ip, closed_port)], CONNECT_TIMEOUT).await;
+        let found = MACHINE.open_ports(vec![(ip, port), (ip, closed_port)], CONNECT_TIMEOUT).await;
         assert_eq!(found, [(ip, port)]);
-        assert_eq!(System.rtsp(ip, port).await.as_deref(), Some("TestCam/1.0"));
+        assert_eq!(MACHINE.rtsp(ip, port).await.as_deref(), Some("TestCam/1.0"));
     }
 
     #[test]
@@ -704,9 +715,9 @@ mod tests {
     #[test]
     fn system_reads_this_machine() {
         // The results depend on the machine. The calls must not fail.
-        let networks = System.networks().unwrap();
+        let networks = MACHINE.networks().unwrap();
         assert!(networks.iter().all(|n| n.prefix >= 24));
-        assert!(System.arp_table().values().all(|mac| mac.len() == 17));
+        assert!(MACHINE.arp_table().values().all(|mac| mac.len() == 17));
     }
 
     /// A fake ONVIF camera on the loopback address. It answers the first
@@ -737,12 +748,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn system_onvif_probe_from_loopback() {
-        // The multicast probe cannot leave the loopback address, so no
-        // camera answers. The call must end after its wait.
+    async fn system_onvif_uses_its_target() {
+        let system = System { onvif_target: fake_camera().await, onvif_wait: Duration::from_millis(300) };
+        let found = system.onvif(Ipv4Addr::LOCALHOST).await;
+        assert_eq!(found[&Ipv4Addr::LOCALHOST].name.as_deref(), Some("Cam"));
+    }
+
+    #[tokio::test]
+    async fn onvif_discovery_ends_while_a_host_still_sends() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buffer = [0u8; 4096];
+            let (_, from) = socket.recv_from(&mut buffer).await.unwrap();
+            let answer =
+                b"<d:ProbeMatch><d:Scopes>onvif://www.onvif.org/name/Flood</d:Scopes></d:ProbeMatch>";
+            loop {
+                let _ = socket.send_to(answer, from).await;
+                tokio::task::yield_now().await;
+            }
+        });
         let started = Instant::now();
-        let _ = System.onvif(Ipv4Addr::LOCALHOST).await;
-        assert!(started.elapsed() < ONVIF_WAIT + Duration::from_secs(1));
+        let found = onvif_discover(Ipv4Addr::LOCALHOST, addr, Duration::from_millis(300)).await;
+        assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
+        assert_eq!(found[&Ipv4Addr::LOCALHOST].name.as_deref(), Some("Flood"));
     }
 
     fn mac_of(vendor: &str, last: u8) -> String {
@@ -854,6 +883,7 @@ mod tests {
         assert_eq!(others[0].0, 4);
         assert!(others[0].1.unwrap().contains("low-cost cameras"));
         assert_eq!(others[1].0, 5);
+        assert!(others[1].1.unwrap().contains("private address"));
     }
 
     #[tokio::test]

@@ -32,7 +32,7 @@ impl Hardware for Machine {
     }
 
     fn lan(&self) -> BoxFuture<'static, Result<LanReport>> {
-        lan::sweep_with(&lan::System).boxed()
+        lan::sweep_with(&lan::MACHINE).boxed()
     }
 
     fn terminal(&self, session: Session, events: Receiver<AppEvent>, start_lan: &dyn Fn()) -> Result<()> {
