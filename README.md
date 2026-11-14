@@ -225,12 +225,13 @@ cameras."
 cargo fmt --all                          # format
 cargo clippy --all-targets -- -D warnings  # lint
 cargo test                               # unit and CLI tests (no Bluetooth needed)
+cargo coverage                           # tests with line coverage, must be 100% (needs cargo-llvm-cov)
 bash tests/install.sh                    # test install.sh against a fake release
 ```
 
 On Linux, the build needs `libdbus-1-dev` and `pkg-config`. CI runs clippy and
 the tests on Linux, macOS and Windows, the install-script test on Linux and
-macOS, and also checks the format, the minimum Rust version, ShellCheck, and
+macOS, and also checks the format, 100% line coverage, the minimum Rust version, ShellCheck, and
 [cargo-deny](https://github.com/EmbarkStudios/cargo-deny) licences and advisories.
 
 ### Releases
@@ -246,7 +247,9 @@ release workflow builds and uploads the binaries.
 
 | File | Job |
 |---|---|
-| `src/ble.rs` | Bluetooth LE scan (btleplug) |
+| `src/cli.rs` | command line, and the `Hardware` trait that tests replace |
+| `src/hardware.rs` | the real Bluetooth adapter, network sweep and terminal (no coverage) |
+| `src/ble.rs` | Bluetooth LE scan loop |
 | `src/signatures.rs` | signature database and matcher |
 | `src/session.rs` | live device list, levels, link to the log |
 | `src/identity.rs` | identity keys that survive an address change |
