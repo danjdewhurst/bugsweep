@@ -122,3 +122,21 @@ fn followers_on_a_new_log_is_empty() {
         .stdout(predicate::str::contains("No device was seen at two or more places."));
     assert!(db.exists(), "the log file was not created");
 }
+
+/// Without --db, the log goes to the data directory of the user. Windows
+/// finds that directory without the environment, so the test is for Unix.
+#[cfg(unix)]
+#[test]
+fn followers_uses_the_default_log() {
+    let home = TempDir::new().unwrap();
+    bugsweep()
+        .arg("followers")
+        .env("HOME", home.path())
+        .env("XDG_DATA_HOME", home.path().join("data"))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No device was seen"));
+    let in_data = home.path().join("data/bugsweep/bugsweep.db");
+    let in_library = home.path().join("Library/Application Support/bugsweep/bugsweep.db");
+    assert!(in_data.exists() || in_library.exists(), "the log is not in the data directory");
+}

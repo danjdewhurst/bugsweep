@@ -12,12 +12,12 @@
 
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
-use if_addrs::IfAddr;
+use futures::future::join_all;
+use if_addrs::{IfAddr, Interface};
 use regex::Regex;
 use serde::Serialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -25,7 +25,7 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
-use crate::place::normalise_mac;
+use crate::place::{normalise_mac, output};
 use crate::vendors;
 
 /// First pass over all addresses. Short, because most addresses are empty.
@@ -35,6 +35,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_millis(400);
 const RETRY_TIMEOUT: Duration = Duration::from_millis(1500);
 const RTSP_TIMEOUT: Duration = Duration::from_millis(900);
 const ONVIF_WAIT: Duration = Duration::from_millis(2500);
+const ONVIF_TARGET: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(239, 255, 255, 250), 3702));
 const PARALLEL_CONNECTS: usize = 128;
 
 /// (port, meaning, strong evidence of a camera).
@@ -181,7 +182,7 @@ pub struct LanReport {
 }
 
 #[derive(Debug, Clone)]
-struct Network {
+pub(crate) struct Network {
     interface: String,
     local: Ipv4Addr,
     base: u32,
@@ -204,11 +205,11 @@ impl Network {
     }
 }
 
-/// Private IPv4 networks of this machine. Large networks shrink to the /24
-/// around the local address, so the sweep stays small.
-fn local_networks() -> Result<Vec<Network>> {
+/// Private IPv4 networks in a list of interfaces. Large networks shrink to
+/// the /24 around the local address, so the sweep stays small.
+fn networks_from(interfaces: &[Interface]) -> Vec<Network> {
     let mut networks: Vec<Network> = Vec::new();
-    for interface in if_addrs::get_if_addrs()? {
+    for interface in interfaces {
         let IfAddr::V4(v4) = &interface.addr else { continue };
         if !v4.ip.is_private() || v4.prefixlen > 30 {
             continue;
@@ -221,7 +222,7 @@ fn local_networks() -> Result<Vec<Network>> {
         }
         networks.push(Network { interface: interface.name.clone(), local: v4.ip, base, prefix });
     }
-    Ok(networks)
+    networks
 }
 
 async fn port_is_open(ip: Ipv4Addr, port: u16, wait: Duration) -> bool {
@@ -324,56 +325,45 @@ fn parse_onvif_answer(xml: &str) -> Option<Onvif> {
     })
 }
 
-/// Send the ONVIF probe from one local address and collect the answers.
-async fn onvif_discover(local: Ipv4Addr) -> BTreeMap<Ipv4Addr, Onvif> {
+/// Send the ONVIF probe from one local address to `target`, and collect the
+/// answers that arrive in `wait`.
+async fn onvif_discover(local: Ipv4Addr, target: SocketAddr, wait: Duration) -> BTreeMap<Ipv4Addr, Onvif> {
     let mut found = BTreeMap::new();
     let Ok(socket) = UdpSocket::bind((local, 0)).await else {
         return found;
     };
-    let target = SocketAddrV4::new(Ipv4Addr::new(239, 255, 255, 250), 3702);
     let message = onvif_probe_message();
     for _ in 0..2 {
         let _ = socket.send_to(message.as_bytes(), target).await;
     }
-    let deadline = Instant::now() + ONVIF_WAIT;
+    let deadline = Instant::now() + wait;
     let mut buffer = vec![0u8; 16 * 1024];
-    loop {
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            break;
-        }
-        match timeout(left, socket.recv_from(&mut buffer)).await {
-            Ok(Ok((read, SocketAddr::V4(from)))) => {
-                let xml = String::from_utf8_lossy(&buffer[..read]);
-                if let Some(onvif) = parse_onvif_answer(&xml) {
-                    found.entry(*from.ip()).or_insert(onvif);
-                }
-            }
-            Ok(Ok(_)) => {}
-            Ok(Err(_)) | Err(_) => break,
+    // The socket is IPv4, so each answer comes from an IPv4 address.
+    while let Ok(Ok((read, SocketAddr::V4(from)))) =
+        timeout(deadline.saturating_duration_since(Instant::now()), socket.recv_from(&mut buffer)).await
+    {
+        let xml = String::from_utf8_lossy(&buffer[..read]);
+        if let Some(onvif) = parse_onvif_answer(&xml) {
+            found.entry(*from.ip()).or_insert(onvif);
         }
     }
     found
 }
 
-/// Read the ARP table of the operating system: IP address to MAC address.
-fn arp_table() -> BTreeMap<Ipv4Addr, String> {
-    let mut table = BTreeMap::new();
-    let args: &[&str] = if cfg!(windows) { &["-a"] } else { &["-an"] };
-    let Ok(output) = Command::new("arp").args(args).output() else {
-        return table;
-    };
-    parse_arp(&String::from_utf8_lossy(&output.stdout), &mut table);
-    table
+/// Read the ARP table text of the operating system.
+fn arp_text() -> Option<String> {
+    output("arp", if cfg!(windows) { &["-a"] } else { &["-an"] })
 }
 
-fn parse_arp(text: &str, table: &mut BTreeMap<Ipv4Addr, String>) {
+/// Parse an ARP table: IP address to MAC address.
+fn parse_arp(text: &str) -> BTreeMap<Ipv4Addr, String> {
     // macOS and Linux: "? (192.168.1.1) at a4:b:c:d:e:f on en0 ..."
     // Windows:         "  192.168.1.1    a4-0b-0c-0d-0e-0f    dynamic"
     let pattern = Regex::new(
         r"\(?(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\)?\s+(?:at\s+)?([0-9A-Fa-f]{1,2}(?:[:-][0-9A-Fa-f]{1,2}){5})",
     )
     .expect("valid pattern");
+    let mut table = BTreeMap::new();
     for captures in pattern.captures_iter(text) {
         let (Ok(ip), Some(mac)) = (captures[1].parse::<Ipv4Addr>(), normalise_mac(&captures[2])) else {
             continue;
@@ -382,51 +372,90 @@ fn parse_arp(text: &str, table: &mut BTreeMap<Ipv4Addr, String>) {
             table.insert(ip, mac);
         }
     }
+    table
 }
 
-/// Run the full sweep.
-pub async fn sweep() -> Result<LanReport> {
+/// What the sweep needs from the system. Tests use a fake.
+pub(crate) trait Probe {
+    /// The local networks to sweep.
+    fn networks(&self) -> Result<Vec<Network>>;
+    /// The ARP table: IP address to MAC address.
+    fn arp_table(&self) -> BTreeMap<Ipv4Addr, String>;
+    /// The targets that accept a TCP connection in `wait`.
+    async fn open_ports(&self, targets: Vec<(Ipv4Addr, u16)>, wait: Duration) -> Vec<(Ipv4Addr, u16)>;
+    /// The ONVIF answers to a probe from `local`.
+    async fn onvif(&self, local: Ipv4Addr) -> BTreeMap<Ipv4Addr, Onvif>;
+    /// The RTSP answer of a host, as in [`rtsp_probe`].
+    async fn rtsp(&self, ip: Ipv4Addr, port: u16) -> Option<String>;
+}
+
+/// The real network of this machine.
+pub(crate) struct System;
+
+impl Probe for System {
+    fn networks(&self) -> Result<Vec<Network>> {
+        Ok(networks_from(&if_addrs::get_if_addrs()?))
+    }
+
+    fn arp_table(&self) -> BTreeMap<Ipv4Addr, String> {
+        parse_arp(&arp_text().unwrap_or_default())
+    }
+
+    async fn open_ports(&self, targets: Vec<(Ipv4Addr, u16)>, wait: Duration) -> Vec<(Ipv4Addr, u16)> {
+        open_ports(targets, wait).await
+    }
+
+    async fn onvif(&self, local: Ipv4Addr) -> BTreeMap<Ipv4Addr, Onvif> {
+        onvif_discover(local, ONVIF_TARGET, ONVIF_WAIT).await
+    }
+
+    async fn rtsp(&self, ip: Ipv4Addr, port: u16) -> Option<String> {
+        rtsp_probe(ip, port).await
+    }
+}
+
+/// Run the full sweep with `probe`.
+pub(crate) async fn sweep_with(probe: &impl Probe) -> Result<LanReport> {
     let started = Instant::now();
-    let networks = local_networks()?;
+    let networks = probe.networks()?;
     if networks.is_empty() {
         bail!("no private IPv4 network found");
     }
-
-    // ONVIF discovery runs at the same time as the port sweep.
-    let onvif_tasks: Vec<_> = networks.iter().map(|n| tokio::spawn(onvif_discover(n.local))).collect();
+    let in_networks =
+        |ip: &Ipv4Addr| networks.iter().any(|network| network.contains(*ip) && network.local != *ip);
 
     let addresses: Vec<Ipv4Addr> = networks.iter().flat_map(Network::hosts).collect();
     let addresses_probed = addresses.len();
-    let first_pass: Vec<(Ipv4Addr, u16)> =
-        addresses.iter().flat_map(|ip| PORTS.iter().map(move |(port, _, _)| (*ip, *port))).collect();
-    let mut open: BTreeMap<Ipv4Addr, Vec<u16>> = BTreeMap::new();
-    for (ip, port) in open_ports(first_pass, CONNECT_TIMEOUT).await {
-        open.entry(ip).or_default().push(port);
-    }
-
-    // The first pass made the system ask for the MAC address of each host,
-    // so the ARP table now lists every host that answered. Try those hosts
-    // again with more time: the first pass can be too fast for them.
-    let in_networks =
-        |ip: &Ipv4Addr| networks.iter().any(|network| network.contains(*ip) && network.local != *ip);
-    let alive: Vec<Ipv4Addr> = arp_table().into_keys().filter(in_networks).collect();
-    let second_pass: Vec<(Ipv4Addr, u16)> = alive
-        .iter()
-        .flat_map(|ip| PORTS.iter().map(move |(port, _, _)| (*ip, *port)))
-        .filter(|(ip, port)| !open.get(ip).is_some_and(|ports| ports.contains(port)))
-        .collect();
-    for (ip, port) in open_ports(second_pass, RETRY_TIMEOUT).await {
-        open.entry(ip).or_default().push(port);
-    }
-
-    let mut onvif: BTreeMap<Ipv4Addr, Onvif> = BTreeMap::new();
-    for task in onvif_tasks {
-        if let Ok(found) = task.await {
-            onvif.extend(found);
+    let port_sweep = async {
+        let first_pass: Vec<(Ipv4Addr, u16)> =
+            addresses.iter().flat_map(|ip| PORTS.iter().map(move |(port, _, _)| (*ip, *port))).collect();
+        let mut open: BTreeMap<Ipv4Addr, Vec<u16>> = BTreeMap::new();
+        for (ip, port) in probe.open_ports(first_pass, CONNECT_TIMEOUT).await {
+            open.entry(ip).or_default().push(port);
         }
-    }
 
-    let arp: BTreeMap<Ipv4Addr, String> = arp_table().into_iter().filter(|(ip, _)| in_networks(ip)).collect();
+        // The first pass made the system ask for the MAC address of each
+        // host, so the ARP table now lists every host that answered. Try
+        // those hosts again with more time: the first pass can be too fast
+        // for them.
+        let alive: Vec<Ipv4Addr> = probe.arp_table().into_keys().filter(in_networks).collect();
+        let second_pass: Vec<(Ipv4Addr, u16)> = alive
+            .iter()
+            .flat_map(|ip| PORTS.iter().map(move |(port, _, _)| (*ip, *port)))
+            .filter(|(ip, port)| !open.get(ip).is_some_and(|ports| ports.contains(port)))
+            .collect();
+        for (ip, port) in probe.open_ports(second_pass, RETRY_TIMEOUT).await {
+            open.entry(ip).or_default().push(port);
+        }
+        open
+    };
+    // ONVIF discovery runs at the same time as the port sweep.
+    let discovery = join_all(networks.iter().map(|n| probe.onvif(n.local)));
+    let (mut open, found) = tokio::join!(port_sweep, discovery);
+    let mut onvif: BTreeMap<Ipv4Addr, Onvif> = found.into_iter().flatten().collect();
+
+    let arp: BTreeMap<Ipv4Addr, String> =
+        probe.arp_table().into_iter().filter(|(ip, _)| in_networks(ip)).collect();
     let class_of =
         |ip: &Ipv4Addr| arp.get(ip).and_then(|mac| vendors::mac_vendor(mac)).and_then(vendor_class);
     let by_vendor =
@@ -441,7 +470,7 @@ pub async fn sweep() -> Result<LanReport> {
         ports.sort();
         let mut rtsp = None;
         for port in ports.iter().copied().filter(|p| matches!(p, 554 | 8554)) {
-            rtsp = rtsp_probe(ip, port).await;
+            rtsp = probe.rtsp(ip, port).await;
             if rtsp.is_some() {
                 break;
             }
@@ -588,8 +617,9 @@ mod tests {
         assert!(!port_is_open(ip, closed_port, CONNECT_TIMEOUT).await);
         assert_eq!(rtsp_probe(ip, closed_port).await, None);
 
-        let found = open_ports(vec![(ip, port), (ip, closed_port)], CONNECT_TIMEOUT).await;
+        let found = System.open_ports(vec![(ip, port), (ip, closed_port)], CONNECT_TIMEOUT).await;
         assert_eq!(found, [(ip, port)]);
+        assert_eq!(System.rtsp(ip, port).await.as_deref(), Some("TestCam/1.0"));
     }
 
     #[test]
@@ -617,14 +647,228 @@ mod tests {
 
     #[test]
     fn arp_formats() {
-        let mut table = BTreeMap::new();
         let text = "? (192.168.1.1) at a4:b:c:d:e:f on en0 ifscope [ethernet]\n\
                     ? (192.168.1.9) at (incomplete) on en0 ifscope [ethernet]\n\
                     ? (192.168.1.255) at ff:ff:ff:ff:ff:ff on en0 ifscope [ethernet]\n\
+                    ? (999.1.1.1) at a4:b:c:d:e:f on en0 ifscope [ethernet]\n\
                     \x20 192.168.1.7           00-11-22-aa-bb-cc     dynamic\n";
-        parse_arp(text, &mut table);
+        let table = parse_arp(text);
         assert_eq!(table.len(), 2);
         assert_eq!(table[&Ipv4Addr::new(192, 168, 1, 1)], "a4:0b:0c:0d:0e:0f");
         assert_eq!(table[&Ipv4Addr::new(192, 168, 1, 7)], "00:11:22:aa:bb:cc");
+    }
+
+    fn interface(name: &str, addr: IfAddr) -> Interface {
+        Interface {
+            name: name.into(),
+            addr,
+            index: None,
+            oper_status: if_addrs::IfOperStatus::Up,
+            is_p2p: false,
+            #[cfg(windows)]
+            adapter_name: String::new(),
+        }
+    }
+
+    fn v4(ip: [u8; 4], prefixlen: u8) -> IfAddr {
+        IfAddr::V4(if_addrs::Ifv4Addr {
+            ip: Ipv4Addr::from(ip),
+            netmask: Ipv4Addr::from(u32::MAX << (32 - prefixlen)),
+            prefixlen,
+            broadcast: None,
+        })
+    }
+
+    #[test]
+    fn networks_from_interfaces() {
+        let interfaces = [
+            interface("lo0", v4([127, 0, 0, 1], 8)),
+            interface(
+                "en0",
+                IfAddr::V6(if_addrs::Ifv6Addr {
+                    ip: "fe80::1".parse().unwrap(),
+                    netmask: "ffff:ffff:ffff:ffff::".parse().unwrap(),
+                    prefixlen: 64,
+                    broadcast: None,
+                }),
+            ),
+            interface("en0", v4([10, 1, 2, 3], 16)),
+            interface("en1", v4([10, 1, 2, 4], 24)),
+            interface("utun0", v4([192, 168, 7, 2], 32)),
+            interface("en2", v4([192, 168, 1, 20], 24)),
+        ];
+        let labels: Vec<String> = networks_from(&interfaces).iter().map(Network::label).collect();
+        assert_eq!(labels, ["10.1.2.0/24 (en0)", "192.168.1.0/24 (en2)"]);
+    }
+
+    #[test]
+    fn system_reads_this_machine() {
+        // The results depend on the machine. The calls must not fail.
+        let networks = System.networks().unwrap();
+        assert!(networks.iter().all(|n| n.prefix >= 24));
+        assert!(System.arp_table().values().all(|mac| mac.len() == 17));
+    }
+
+    /// A fake ONVIF camera on the loopback address. It answers the first
+    /// probe with some noise and one probe match.
+    async fn fake_camera() -> SocketAddr {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buffer = [0u8; 4096];
+            let (_, from) = socket.recv_from(&mut buffer).await.unwrap();
+            socket.send_to(b"not ONVIF", from).await.unwrap();
+            let answer = "<d:ProbeMatch><d:Scopes>onvif://www.onvif.org/name/Cam</d:Scopes></d:ProbeMatch>";
+            socket.send_to(answer.as_bytes(), from).await.unwrap();
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn onvif_discovery_against_a_local_camera() {
+        let camera = fake_camera().await;
+        let found = onvif_discover(Ipv4Addr::LOCALHOST, camera, Duration::from_millis(300)).await;
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[&Ipv4Addr::LOCALHOST].name.as_deref(), Some("Cam"));
+
+        // An address that is not on this machine cannot send a probe.
+        let foreign = Ipv4Addr::new(192, 0, 2, 1);
+        assert!(onvif_discover(foreign, camera, Duration::from_millis(300)).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn system_onvif_probe_from_loopback() {
+        // The multicast probe cannot leave the loopback address, so no
+        // camera answers. The call must end after its wait.
+        let started = Instant::now();
+        let _ = System.onvif(Ipv4Addr::LOCALHOST).await;
+        assert!(started.elapsed() < ONVIF_WAIT + Duration::from_secs(1));
+    }
+
+    fn mac_of(vendor: &str, last: u8) -> String {
+        let line = include_str!("../data/oui.tsv").lines().find(|line| line.ends_with(vendor)).unwrap();
+        format!("{}:{}:{}:00:00:{last:02x}", &line[0..2], &line[2..4], &line[4..6])
+    }
+
+    /// A network that the tests control.
+    #[derive(Default)]
+    struct FakeProbe {
+        /// `None` makes `networks` fail.
+        networks: Option<Vec<Network>>,
+        arp: BTreeMap<Ipv4Addr, String>,
+        /// Ports that answer in the first pass.
+        fast: Vec<(Ipv4Addr, u16)>,
+        /// Ports that answer only in the second pass.
+        slow: Vec<(Ipv4Addr, u16)>,
+        onvif: BTreeMap<Ipv4Addr, Onvif>,
+        rtsp: BTreeMap<(Ipv4Addr, u16), String>,
+    }
+
+    impl Probe for FakeProbe {
+        fn networks(&self) -> Result<Vec<Network>> {
+            self.networks.clone().ok_or_else(|| anyhow::anyhow!("no interfaces"))
+        }
+
+        fn arp_table(&self) -> BTreeMap<Ipv4Addr, String> {
+            self.arp.clone()
+        }
+
+        async fn open_ports(&self, targets: Vec<(Ipv4Addr, u16)>, wait: Duration) -> Vec<(Ipv4Addr, u16)> {
+            let answering = if wait == CONNECT_TIMEOUT { &self.fast } else { &self.slow };
+            targets.into_iter().filter(|target| answering.contains(target)).collect()
+        }
+
+        async fn onvif(&self, local: Ipv4Addr) -> BTreeMap<Ipv4Addr, Onvif> {
+            if local == Ipv4Addr::new(192, 168, 1, 20) { self.onvif.clone() } else { BTreeMap::new() }
+        }
+
+        async fn rtsp(&self, ip: Ipv4Addr, port: u16) -> Option<String> {
+            self.rtsp.get(&(ip, port)).cloned()
+        }
+    }
+
+    fn home_network() -> Network {
+        Network {
+            interface: "en0".into(),
+            local: Ipv4Addr::new(192, 168, 1, 20),
+            base: u32::from(Ipv4Addr::new(192, 168, 1, 0)),
+            prefix: 24,
+        }
+    }
+
+    #[tokio::test]
+    async fn sweep_finds_cameras() {
+        let ip = |last| Ipv4Addr::new(192, 168, 1, last);
+        let guest = Network {
+            interface: "en1".into(),
+            local: Ipv4Addr::new(10, 0, 0, 2),
+            base: u32::from(Ipv4Addr::new(10, 0, 0, 0)),
+            prefix: 24,
+        };
+        let probe = FakeProbe {
+            networks: Some(vec![home_network(), guest]),
+            arp: BTreeMap::from([
+                (ip(2), mac_of("\tHangzhou Hikvision Digital Technology Co.,Ltd.", 2)),
+                (ip(3), mac_of("\tWyze Labs Inc", 3)),
+                (ip(4), mac_of("\tEspressif Inc.", 4)),
+                (ip(5), "da:a1:19:00:00:05".into()),
+                (ip(6), "00:11:22:00:00:06".into()),
+                (ip(20), "00:11:22:00:00:20".into()),
+                (Ipv4Addr::new(172, 16, 0, 1), "00:11:22:00:00:99".into()),
+            ]),
+            fast: vec![(ip(6), 8000), (ip(7), 554), (ip(8), 8554), (ip(8), 554), (ip(9), 37777)],
+            slow: vec![(ip(6), 1935), (ip(6), 8000)],
+            onvif: BTreeMap::from([(ip(10), Onvif { name: Some("Door".into()), ..Onvif::default() })]),
+            rtsp: BTreeMap::from([((ip(7), 554), "yes".to_string()), ((ip(8), 8554), "Cam/1".to_string())]),
+        };
+        let report = sweep_with(&probe).await.unwrap();
+        assert_eq!(report.networks, ["192.168.1.0/24 (en0)", "10.0.0.0/24 (en1)"]);
+        assert_eq!(report.addresses_probed, 2 * 253);
+
+        let summary: Vec<(u8, Verdict, Option<&str>)> =
+            report.hosts.iter().map(|h| (h.ip.octets()[3], h.verdict, h.rtsp.as_deref())).collect();
+        assert_eq!(
+            summary,
+            [
+                (2, Verdict::Likely, None),
+                (7, Verdict::Likely, Some("yes")),
+                (8, Verdict::Likely, Some("Cam/1")),
+                (9, Verdict::Likely, None),
+                (10, Verdict::Likely, None),
+                (3, Verdict::Possible, None),
+                (6, Verdict::Possible, None),
+            ]
+        );
+        let hikvision = &report.hosts[0];
+        assert!(hikvision.camera_vendor);
+        assert!(hikvision.vendor.as_deref().unwrap().starts_with("Hangzhou Hikvision"));
+        // The second pass adds 1935; 8000 answered in the first pass already.
+        let ports: Vec<u16> = report.hosts[6].open_ports.iter().map(|p| p.port).collect();
+        assert_eq!(ports, [1935, 8000]);
+        assert_eq!(report.hosts[4].onvif.as_ref().unwrap().name.as_deref(), Some("Door"));
+
+        // Other hosts: in the network, not the local address, no evidence.
+        let others: Vec<(u8, Option<&str>)> =
+            report.others.iter().map(|o| (o.ip.octets()[3], o.note)).collect();
+        assert_eq!(others.len(), 2);
+        assert_eq!(others[0].0, 4);
+        assert!(others[0].1.unwrap().contains("low-cost cameras"));
+        assert_eq!(others[1].0, 5);
+    }
+
+    #[tokio::test]
+    async fn sweep_needs_a_network() {
+        let failing = FakeProbe::default();
+        assert_eq!(sweep_with(&failing).await.unwrap_err().to_string(), "no interfaces");
+        let empty = FakeProbe { networks: Some(Vec::new()), ..FakeProbe::default() };
+        assert_eq!(sweep_with(&empty).await.unwrap_err().to_string(), "no private IPv4 network found");
+    }
+
+    #[tokio::test]
+    async fn quiet_network() {
+        let probe = FakeProbe { networks: Some(vec![home_network()]), ..FakeProbe::default() };
+        let report = sweep_with(&probe).await.unwrap();
+        assert!(report.hosts.is_empty());
+        assert!(report.others.is_empty());
     }
 }

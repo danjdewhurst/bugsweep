@@ -1,6 +1,8 @@
 //! bugsweep: a radio check for trackers, cameras, recorders and smart glasses.
 
 pub mod ble;
+pub mod cli;
+pub mod hardware;
 pub mod identity;
 pub mod lan;
 pub mod model;
