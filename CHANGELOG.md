@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.0](https://github.com/danjdewhurst/bugsweep/compare/v0.1.1...v0.2.0) (2026-11-14)
+
+
+### Features
+
+* add a desktop window (bugsweep gui) ([b3d5176](https://github.com/danjdewhurst/bugsweep/commit/b3d51768df161a0ba4f08a148ddf846f9d603572))
+
+
+### Bug Fixes
+
+* drop the RSSI value 127 that CoreBluetooth sends when it has no value ([b3d5176](https://github.com/danjdewhurst/bugsweep/commit/b3d51768df161a0ba4f08a148ddf846f9d603572))
+
 ## [0.1.1](https://github.com/danjdewhurst/bugsweep/compare/v0.1.0...v0.1.1) (2026-11-14)
 
 
