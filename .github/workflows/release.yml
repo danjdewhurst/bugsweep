@@ -154,4 +154,6 @@ jobs:
             exit 1
           fi
           gh release upload "$TAG" dist/*.tar.gz dist/*.zip dist/*.sha256 dist/SHA256SUMS --clobber
-          gh release edit "$TAG" --draft=false --latest
+          # "legacy" marks the release as latest only if it has the highest version.
+          id="$(gh release view "$TAG" --json databaseId --jq .databaseId)"
+          gh api -X PATCH "repos/$GH_REPO/releases/$id" -F draft=false -f make_latest=legacy > /dev/null

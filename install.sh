@@ -74,7 +74,7 @@ detect_target() {
       # musl's ldd exits 1 after its banner, so do not test the exit status.
       local libc
       libc="$(ldd --version 2>&1 || true)"
-      if [[ "$libc" == *musl* ]] || ls /lib/ld-musl-* > /dev/null 2>&1; then
+      if [[ "$libc" == *musl* ]]; then
         die "no prebuilt binary for musl libc (Alpine). Build from source: cargo install --locked --git https://github.com/$REPO"
       fi
       printf '%s-unknown-linux-gnu\n' "$arch"
@@ -93,10 +93,19 @@ detect_target() {
   esac
 }
 
+# Global, so that the EXIT trap can see them after main returns.
+tmp=""
+new=""
+cleanup() {
+  [[ -z "$tmp" ]] || rm -rf "$tmp"
+  [[ -z "$new" ]] || rm -f "$new"
+}
+
 main() {
   local version="${BUGSWEEP_VERSION:-latest}"
   local dir="${BUGSWEEP_INSTALL_DIR:-${HOME:?HOME is not set}/.local/bin}"
   local target="${BUGSWEEP_TARGET:-}"
+  local check_run=1
   local base="${BUGSWEEP_DOWNLOAD_URL:-https://github.com/$REPO/releases}"
   case "$base" in
     https://* | file://*) ;;
@@ -119,7 +128,8 @@ main() {
   need uname
   need tar
   need mktemp
-  [[ -n "$target" ]] || target="$(detect_target)"
+  # A target that the user picks may be for another machine, so do not run it here.
+  if [[ -n "$target" ]]; then check_run=0; else target="$(detect_target)"; fi
 
   local url
   if [[ "$version" == "latest" ]]; then
@@ -131,10 +141,8 @@ main() {
   fi
 
   local name="bugsweep-$target"
-  local tmp
   tmp="$(mktemp -d)"
-  # shellcheck disable=SC2064 # expand $tmp now, while it is set
-  trap "rm -rf '$tmp'" EXIT
+  trap cleanup EXIT
 
   say "downloading $name ($version)"
   download "$url/$name.tar.gz" "$tmp/$name.tar.gz" ||
@@ -151,10 +159,18 @@ main() {
   tar -xzf "$tmp/$name.tar.gz" -C "$tmp"
   [[ -f "$tmp/$name/bugsweep" ]] || die "the archive has no $name/bugsweep"
 
+  mkdir -p "$dir" 2> /dev/null || die "cannot create $dir. Choose another --dir, or pipe the script to 'sudo bash'"
+  [[ -w "$dir" ]] || die "cannot write to $dir. Choose another --dir, or pipe the script to 'sudo bash'"
+  # Copy to a temporary file next to the target, then rename, so a running
+  # bugsweep keeps its old file. /tmp can be noexec, so the check runs here.
+  new="$(mktemp "$dir/.bugsweep.XXXXXX")" || die "cannot write to $dir"
+  cp "$tmp/$name/bugsweep" "$new"
+  chmod 755 "$new"
+
   # Run the new binary before it replaces anything. A missing library or a
   # glibc that is too old fails here, not after the install.
-  local installed
-  if ! installed="$("$tmp/$name/bugsweep" --version 2>&1)"; then
+  local installed="bugsweep"
+  if [[ "$check_run" == 1 ]] && ! installed="$("$new" --version 2>&1)"; then
     say "the $target build does not run on this system:"
     printf '%s\n' "$installed" >&2
     case "$target" in
@@ -162,15 +178,8 @@ main() {
     esac
     die "nothing was installed. Build from source: cargo install --locked --git https://github.com/$REPO"
   fi
-
-  mkdir -p "$dir" 2> /dev/null || die "cannot create $dir. Choose another --dir, or pipe the script to 'sudo bash'"
-  [[ -w "$dir" ]] || die "cannot write to $dir. Choose another --dir, or pipe the script to 'sudo bash'"
-  # Copy to a new temporary file, then rename, so a running bugsweep keeps its old file.
-  local new
-  new="$(mktemp "$dir/.bugsweep.XXXXXX")" || die "cannot write to $dir"
-  cp "$tmp/$name/bugsweep" "$new"
-  chmod 755 "$new"
   mv -f "$new" "$dir/bugsweep"
+  new=""
 
   say "installed $installed to $dir/bugsweep"
 

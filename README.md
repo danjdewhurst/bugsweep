@@ -228,10 +228,10 @@ cargo test                               # unit and CLI tests (no Bluetooth need
 bash tests/install.sh                    # test install.sh against a fake release
 ```
 
-On Linux, the build needs `libdbus-1-dev` and `pkg-config`. CI runs the checks
-above on Linux, macOS and Windows, plus the minimum Rust version, ShellCheck,
-and [cargo-deny](https://github.com/EmbarkStudios/cargo-deny) for licences and
-advisories.
+On Linux, the build needs `libdbus-1-dev` and `pkg-config`. CI runs clippy and
+the tests on Linux, macOS and Windows, the install-script test on Linux and
+macOS, and also checks the format, the minimum Rust version, ShellCheck, and
+[cargo-deny](https://github.com/EmbarkStudios/cargo-deny) licences and advisories.
 
 ### Releases
 

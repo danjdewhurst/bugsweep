@@ -63,6 +63,11 @@ echo "case: a binary that does not run is not installed"
 if "$sh" install.sh --version v9.9.8 --dir "$work/bin6" 2> /dev/null; then fail "broken binary accepted"; fi
 [[ ! -e "$work/bin6/bugsweep" ]] || fail "broken binary was installed"
 
+echo "case: an explicit --target skips the run check"
+"$sh" install.sh --version v9.9.8 --target "$target" --dir "$work/bin9" 2> /dev/null
+[[ -x "$work/bin9/bugsweep" ]] || fail "explicit target"
+[[ -z "$(find "$work/bin6" "$work/bin9" -name '.bugsweep.*' 2> /dev/null)" ]] || fail "temporary file left behind"
+
 echo "case: plain http is refused"
 out="$(BUGSWEEP_DOWNLOAD_URL="http://example.invalid" "$sh" install.sh --dir "$work/bin7" 2>&1 || true)"
 [[ "$out" == *"must start with https://"* ]] || fail "http accepted"
