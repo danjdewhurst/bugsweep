@@ -124,6 +124,13 @@ mod tests {
     }
 
     #[test]
+    fn each_basis_has_its_own_label() {
+        let labels: Vec<&str> =
+            [Basis::Id, Basis::Tracker, Basis::Name, Basis::Data].into_iter().map(Basis::label).collect();
+        assert_eq!(labels, ["ID", "tracker key", "name", "data"]);
+    }
+
+    #[test]
     fn plain_device_has_only_the_id() {
         let advert = Advert { id: "abc".into(), ..Default::default() };
         assert_eq!(texts(&advert, true), ["id:abc"]);

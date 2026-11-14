@@ -4,6 +4,6 @@
 
 ## Checks
 
-- [ ] `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings` and `cargo test` pass
+- [ ] `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings` and `cargo coverage` pass
 - [ ] New signatures have a test, an honest `evidence` and a `source`
 - [ ] README or skills updated if the CLI or its output changed

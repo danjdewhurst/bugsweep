@@ -546,8 +546,21 @@ mod tests {
         );
         assert!(SignatureDb::parse(&byte_without_uuid).is_err());
         assert!(SignatureDb::parse(BASE).is_err(), "a signature needs a match rule");
+        let no_rules = format!("{BASE}match = []\n");
+        let error = SignatureDb::parse(&no_rules).err().unwrap();
+        assert!(error.to_string().contains("has no match rules"), "{error:#}");
         let twice = format!("{good}{good}");
         assert!(SignatureDb::parse(&twice).is_err(), "duplicate ID");
+
+        for (rule, message) in [
+            ("company_id = 1\nmanufacturer_data_prefix = \"zz\"", "bad hex string \"zz\""),
+            ("service_uuid = \"nope\"", "bad UUID \"nope\""),
+            ("name_regex = \"(\"", "bad name_regex \"(\""),
+        ] {
+            let text = format!("{BASE}\n[[signature.match]]\n{rule}\n");
+            let error = format!("{:#}", SignatureDb::parse(&text).err().unwrap());
+            assert!(error.contains("signature \"x\"") && error.contains(message), "{error}");
+        }
     }
 
     #[test]
@@ -556,6 +569,51 @@ mod tests {
         let unknown = format!("{BASE}overrides = [\"nope\"]{rule}");
         assert!(SignatureDb::parse(&unknown).is_err());
         let own = format!("{BASE}overrides = [\"x\"]{rule}");
-        assert!(SignatureDb::parse(&own).is_err());
+        let error = SignatureDb::parse(&own).err().unwrap();
+        assert!(error.to_string().contains("overrides itself"), "{error:#}");
+    }
+
+    #[test]
+    fn labels_match_the_file_format() {
+        use Category::*;
+        let categories: Vec<&str> = [Tracker, Glasses, Recorder, Camera, Bodycam, Tool, Generic]
+            .into_iter()
+            .map(Category::label)
+            .collect();
+        assert_eq!(categories, ["tracker", "glasses", "recorder", "camera", "bodycam", "tool", "generic"]);
+        let levels: Vec<&str> =
+            [Level::Info, Level::Low, Level::Medium, Level::High].into_iter().map(Level::label).collect();
+        assert_eq!(levels, ["info", "low", "medium", "high"]);
+        let evidence: Vec<&str> =
+            [Evidence::Spec, Evidence::Research, Evidence::Code, Evidence::Registry, Evidence::Guess]
+                .into_iter()
+                .map(Evidence::label)
+                .collect();
+        assert_eq!(evidence, ["spec", "research", "code", "registry", "guess"]);
+    }
+
+    #[test]
+    fn signature_files_load_or_name_the_problem() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good.toml");
+        std::fs::write(&good, format!("{BASE}\n[[signature.match]]\ncompany_id = 1\n")).unwrap();
+        assert_eq!(SignatureDb::from_file(&good).unwrap().all().len(), 1);
+
+        let missing = dir.path().join("missing.toml");
+        let error = format!("{:#}", SignatureDb::from_file(&missing).err().unwrap());
+        assert!(error.starts_with("cannot read") && error.contains("missing.toml"), "{error}");
+
+        let bad = dir.path().join("bad.toml");
+        std::fs::write(&bad, "not toml [").unwrap();
+        let error = format!("{:#}", SignatureDb::from_file(&bad).err().unwrap());
+        assert!(error.starts_with("signature file") && error.contains("bad.toml"), "{error}");
+    }
+
+    #[test]
+    fn each_evidence_kind_has_a_description() {
+        let all = [Evidence::Spec, Evidence::Research, Evidence::Code, Evidence::Registry, Evidence::Guess];
+        let texts: std::collections::HashSet<&str> = all.iter().map(|e| e.describe()).collect();
+        assert_eq!(texts.len(), all.len());
+        assert_eq!(Evidence::Guess.describe(), "a guess, not confirmed");
     }
 }

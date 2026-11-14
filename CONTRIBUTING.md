@@ -14,7 +14,9 @@ signatures, most of all rules that were checked against a real device.
    cargo test
    ```
 
-The tests need no Bluetooth adapter and no network.
+The tests need no Bluetooth adapter and send nothing to the network. Some
+tests read the network state of the machine (interfaces, ARP table, default
+route) and use local sockets on 127.0.0.1.
 
 ## Before you open a pull request
 
@@ -22,11 +24,26 @@ The tests need no Bluetooth adapter and no network.
 cargo fmt --all
 cargo clippy --all-targets -- -D warnings
 cargo test
+cargo coverage          # needs cargo-llvm-cov; line coverage must stay at 100%
 bash tests/install.sh   # only if you changed install.sh
 ```
 
-CI runs clippy and the tests on Linux, macOS and Windows, the format check on
-Linux, and the install-script test on Linux and macOS.
+CI runs clippy and the tests on Linux, macOS and Windows, the format check and
+the coverage check on Linux, and the install-script test on Linux and macOS.
+
+## Tests and coverage
+
+Each line of code needs a test, and CI fails below 100% line coverage. Install
+the tool with `cargo install cargo-llvm-cov` (or `brew install cargo-llvm-cov`)
+and `rustup component add llvm-tools-preview`.
+
+The coverage check skips one file: `src/hardware.rs`. It holds the only code
+that needs a Bluetooth adapter, a network to sweep or an interactive terminal:
+the btleplug calls and their event mapping, the real sweep, and the terminal
+setup and key reader. No test checks that code, so keep each function there
+short and plain. Put logic in the other modules, where tests
+reach it through fakes: `cli::Hardware`, `ble::Radio`, `lan::Probe` and the
+command runner in `place.rs`.
 
 ## Commit messages
 
