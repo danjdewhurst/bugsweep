@@ -5,6 +5,7 @@
 //! and the coverage check skips this file. Keep each function here short, and put all logic
 //! in the other modules, where tests reach it through fakes.
 
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -48,7 +49,11 @@ impl Hardware for Machine {
         let live = Arc::new(Mutex::new(Live::new(session)));
         let pump_live = Arc::clone(&live);
         // The thread keeps the session current also while the window draws nothing.
-        std::thread::spawn(move || gui::pump(events, &pump_live));
+        std::thread::spawn(move || {
+            if panic::catch_unwind(AssertUnwindSafe(|| gui::pump(events, &pump_live))).is_err() {
+                gui::fail(&pump_live, "the event thread stopped; restart bugsweep");
+            }
+        });
         let gui = Gui::new(live, start_lan);
         let options = eframe::NativeOptions {
             viewport: eframe::egui::ViewportBuilder::default()

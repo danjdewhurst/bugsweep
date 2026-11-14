@@ -91,6 +91,12 @@ pub fn pump(events: Receiver<AppEvent>, live: &Mutex<Live>) {
     }
 }
 
+/// Show in the header that the events stopped, for example because the
+/// event thread panicked.
+pub fn fail(live: &Mutex<Live>, reason: &str) {
+    lock(live).on_event(AppEvent::Ble(BleEvent::Failed(reason.into())));
+}
+
 /// A panic while the lock was held does not make the state unusable, so
 /// use it also when the lock is poisoned.
 fn lock(live: &Mutex<Live>) -> MutexGuard<'_, Live> {
@@ -246,7 +252,10 @@ impl<'a> Gui<'a> {
         CentralPanel::default().show_inside(ui, |ui| {
             ui.checkbox(&mut show_all, "Show devices without a finding");
             ui.add_space(4.0);
-            clicked = device_table(ui, session, &devices, selected.as_deref());
+            // The table scrolls only up and down, so a narrow window scrolls it sideways.
+            ScrollArea::horizontal().show(ui, |ui| {
+                clicked = device_table(ui, session, &devices, selected.as_deref());
+            });
         });
 
         self.show_all = show_all;
@@ -875,6 +884,13 @@ name_regex = "^InfoTag"
         assert!(live.ble_ok);
         assert!(live.session.get("tag").is_some());
         assert!(matches!(&live.lan, LanState::Failed(error) if error == "no network"));
+        drop(live);
+
+        // A stopped event thread shows as a failure.
+        let live = Mutex::new(Live::new(session()));
+        fail(&live, "the event thread stopped");
+        assert!(!lock(&live).ble_ok);
+        assert_eq!(lock(&live).ble_status, "failed: the event thread stopped");
     }
 
     fn report(hosts: Vec<LanHost>) -> LanReport {
