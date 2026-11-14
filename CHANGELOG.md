@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1](https://github.com/danjdewhurst/bugsweep/compare/v0.1.0...v0.1.1) (2026-11-14)
+
+
+### Bug Fixes
+
+* reach 100% test coverage, and fix empty names, write errors and an endless ONVIF wait ([#3](https://github.com/danjdewhurst/bugsweep/issues/3)) ([af20f1f](https://github.com/danjdewhurst/bugsweep/commit/af20f1f46f4b352ee674351d697195a2592904e4))
+
 ## 0.1.0 (2026-11-14)
 
 
