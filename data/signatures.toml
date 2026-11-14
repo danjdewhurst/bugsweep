@@ -1,0 +1,905 @@
+# bugsweep signature database
+#
+# Each [[signature]] describes one kind of device that can track, film or
+# record a person. A signature has one or more [[signature.match]] rules.
+# A device matches the signature when ANY rule matches. A rule matches when
+# ALL of its conditions match.
+#
+# Rule conditions:
+#   company_id                 Bluetooth SIG company ID in the manufacturer data
+#   manufacturer_data_prefix   hex bytes at the start of that manufacturer data
+#                              (after the company ID). Needs company_id.
+#   manufacturer_data_byte     { offset, mask, value } test on one byte of that
+#                              manufacturer data. Needs company_id.
+#   service_uuid               advertised service UUID (16-bit "fd5a" or full)
+#   service_data_uuid          UUID that carries service data
+#   service_data_prefix        hex bytes at the start of that service data.
+#                              Needs service_data_uuid.
+#   service_data_byte          { offset, mask, value } test on one byte of that
+#                              service data. Needs service_data_uuid.
+#   name_regex                 regular expression on the advertised name
+#   address_prefix             MAC address prefix "00:25:DF". Not available on
+#                              macOS and iOS, which hide the address.
+#
+# Fields:
+#   category     tracker | glasses | recorder | camera | bodycam | tool | generic
+#   severity     info | low | medium | high   (how much the user should care)
+#   confidence   low | medium | high          (how sure the rule is)
+#   evidence     where the rule comes from, strongest first:
+#                  spec      official specification, or vendor source or firmware
+#                  research  paper or published capture from a real device
+#                  code      source code of another client or detector
+#                  registry  the ID is registered to the vendor, but its use in
+#                            advertisements is not proven
+#                  guess     name pattern or assumption
+#   source       the documents or projects behind the rule
+#   overrides    IDs of less specific signatures. When this signature and one
+#                of those match the same device, only this one is reported.
+#
+# Main sources, with the short names used below:
+#   AirGuard   github.com/seemoo-lab/AirGuard (Android tracker detector)
+#   FMNA       Apple Find My Network Accessory Specification, release R1
+#   FMDN       developers.google.com/nearby/fast-pair/specifications/extensions/fmdn
+#   DULT       IETF draft-ietf-dult-accessory-protocol-01
+#   Yu 2022    Yu et al., "Privacy Analysis of Samsung's Crowd-Sourced Bluetooth
+#              Location Tracking System", arXiv 2210.14702
+#   Omi app    github.com/BasedHardware/omi (connectors for other recorders)
+#   ACAB       github.com/soyboi1312/all-cameras-are-beacons
+#   flock-you  github.com/colonelpanichacks/flock-you
+
+# ================================================================ trackers
+
+[[signature]]
+id = "apple-airtag-separated"
+name = "Apple AirTag, away from its owner"
+category = "tracker"
+severity = "high"
+confidence = "high"
+evidence = "code"
+source = "AirGuard DeviceManager.calculateDeviceType: manufacturer data 12 19, device type = (status byte & 0x30) >> 4, 1 = AirTag."
+notes = "An AirTag sends this frame only when it is not near its owner's phone."
+[[signature.match]]
+company_id = 0x004C
+manufacturer_data_prefix = "1219"
+manufacturer_data_byte = { offset = 2, mask = 0x30, value = 0x10 }
+
+[[signature]]
+id = "apple-findmy-accessory-separated"
+name = "Find My accessory, away from its owner"
+category = "tracker"
+severity = "high"
+confidence = "high"
+evidence = "spec"
+source = "FMNA table 5-4: status bit 5 is 1 for licensed accessories. AirGuard device type 2. Checked on one real third-party key tag."
+notes = "A third-party Find My tag. AirGuard reports that an AirTag (2nd generation) can also send this type."
+[[signature.match]]
+company_id = 0x004C
+manufacturer_data_prefix = "1219"
+manufacturer_data_byte = { offset = 2, mask = 0x30, value = 0x20 }
+
+[[signature]]
+id = "apple-airpods-separated"
+name = "Apple AirPods, away from their owner"
+category = "tracker"
+severity = "low"
+confidence = "high"
+evidence = "code"
+source = "AirGuard device type 3."
+notes = "Usually lost or left behind. They can also be used as a tracker."
+[[signature.match]]
+company_id = 0x004C
+manufacturer_data_prefix = "1219"
+manufacturer_data_byte = { offset = 2, mask = 0x30, value = 0x30 }
+
+[[signature]]
+id = "apple-device-offline-finding"
+name = "Apple device in offline Find My mode"
+category = "tracker"
+severity = "info"
+confidence = "high"
+evidence = "code"
+source = "AirGuard device type 0."
+notes = "An iPhone, iPad or Mac without a network connection. Normally harmless."
+[[signature.match]]
+company_id = 0x004C
+manufacturer_data_prefix = "1219"
+manufacturer_data_byte = { offset = 2, mask = 0x30, value = 0x00 }
+
+[[signature]]
+id = "apple-findmy-near-owner"
+name = "Find My device, near its owner"
+category = "tracker"
+severity = "info"
+confidence = "medium"
+evidence = "spec"
+source = "FMNA table 5-3: nearby payload has type 0x12 and length 0x02. AirGuard treats each length other than 0x19 as connected."
+notes = "The owner's phone was in range in the last minutes."
+[[signature.match]]
+company_id = 0x004C
+manufacturer_data_prefix = "1202"
+
+[[signature]]
+id = "dult-separated-tracker"
+name = "Location tracker in separated mode (DULT standard)"
+category = "tracker"
+severity = "high"
+confidence = "high"
+evidence = "spec"
+source = "DULT sections 3.4.2 and 3.9: service data 0xFCB2, byte 1 bit 0 is the near-owner bit, 0 = separated."
+overrides = ["dult-tracker-unknown-state"]
+[[signature.match]]
+service_data_uuid = "fcb2"
+service_data_byte = { offset = 1, mask = 0x01, value = 0x00 }
+
+[[signature]]
+id = "dult-near-owner-tracker"
+name = "Location tracker near its owner (DULT standard)"
+category = "tracker"
+severity = "info"
+confidence = "high"
+evidence = "spec"
+source = "DULT: near-owner bit = 1."
+overrides = ["dult-tracker-unknown-state"]
+[[signature.match]]
+service_data_uuid = "fcb2"
+service_data_byte = { offset = 1, mask = 0x01, value = 0x01 }
+
+[[signature]]
+id = "dult-tracker-unknown-state"
+name = "Location tracker (DULT standard), state unknown"
+category = "tracker"
+severity = "medium"
+confidence = "medium"
+evidence = "spec"
+source = "DULT: service UUID 0xFCB2. The frame is too short or has an older layout."
+[[signature.match]]
+service_data_uuid = "fcb2"
+[[signature.match]]
+service_uuid = "fcb2"
+
+[[signature]]
+id = "google-fmdn-unwanted-tracking-mode"
+name = "Google Find Hub tracker, away from its owner"
+category = "tracker"
+severity = "high"
+confidence = "high"
+evidence = "spec"
+source = "FMDN tables 15 and 16: service data 0xFEAA, frame type 0x41 = unwanted tracking protection mode."
+[[signature.match]]
+service_data_uuid = "feaa"
+service_data_prefix = "41"
+
+[[signature]]
+id = "google-fmdn-tracker"
+name = "Google Find Hub tracker or phone"
+category = "tracker"
+severity = "medium"
+confidence = "high"
+evidence = "spec"
+source = "FMDN: service data 0xFEAA, frame type 0x40."
+notes = "Not in unwanted tracking protection mode. This does not show that the owner is near: the network turns that mode on only after some time away. Android phones in the Find Hub network send the same frame."
+[[signature.match]]
+service_data_uuid = "feaa"
+service_data_prefix = "40"
+
+[[signature]]
+id = "samsung-smarttag-lost-24h"
+name = "Samsung SmartTag, away from its owner for more than 24 hours"
+category = "tracker"
+severity = "high"
+confidence = "high"
+evidence = "code"
+source = "AirGuard SamsungTracker.kt: service data 0xFD5A, (byte 0 & 0xF8) == 0x10, state = byte 0 & 0x07, 3 = overmature offline. Yu 2022 table 1."
+overrides = ["samsung-smarttag"]
+[[signature.match]]
+service_data_uuid = "fd5a"
+service_data_prefix = "13"
+
+[[signature]]
+id = "samsung-smarttag-lost"
+name = "Samsung SmartTag, away from its owner (15 minutes to 24 hours)"
+category = "tracker"
+severity = "high"
+confidence = "high"
+evidence = "code"
+source = "AirGuard SamsungTracker.kt and Yu 2022: state 2 = offline."
+overrides = ["samsung-smarttag"]
+[[signature.match]]
+service_data_uuid = "fd5a"
+service_data_prefix = "12"
+
+[[signature]]
+id = "samsung-smarttag-just-disconnected"
+name = "Samsung SmartTag, disconnected for less than 15 minutes"
+category = "tracker"
+severity = "low"
+confidence = "high"
+evidence = "code"
+source = "AirGuard SamsungTracker.kt and Yu 2022: state 1 = premature offline. Also sent after a restart."
+overrides = ["samsung-smarttag"]
+[[signature.match]]
+service_data_uuid = "fd5a"
+service_data_prefix = "11"
+
+[[signature]]
+id = "samsung-smarttag-near-owner"
+name = "Samsung SmartTag, connected to its owner"
+category = "tracker"
+severity = "info"
+confidence = "high"
+evidence = "code"
+source = "AirGuard SamsungTracker.kt and Yu 2022: states 4 to 6 = paired or connected."
+overrides = ["samsung-smarttag"]
+[[signature.match]]
+service_data_uuid = "fd5a"
+service_data_prefix = "14"
+[[signature.match]]
+service_data_uuid = "fd5a"
+service_data_prefix = "15"
+[[signature.match]]
+service_data_uuid = "fd5a"
+service_data_prefix = "16"
+
+[[signature]]
+id = "samsung-smarttag"
+name = "Samsung SmartTag, state unknown"
+category = "tracker"
+severity = "medium"
+confidence = "medium"
+evidence = "registry"
+source = "Service UUID 0xFD5A is registered to Samsung and used for SmartThings Find. The frame does not have the known layout."
+[[signature.match]]
+service_data_uuid = "fd5a"
+[[signature.match]]
+service_uuid = "fd5a"
+
+[[signature]]
+id = "samsung-smarttag-unregistered"
+name = "Samsung SmartTag, not registered"
+category = "tracker"
+severity = "info"
+confidence = "medium"
+evidence = "research"
+source = "Yu 2022 section 3: service UUID 0xFD59 for tags without an owner account."
+notes = "A tag without an owner account cannot report a location. Other Samsung devices can use this UUID during setup."
+[[signature.match]]
+service_uuid = "fd59"
+[[signature.match]]
+service_data_uuid = "fd59"
+
+[[signature]]
+id = "samsung-offline-finding-device"
+name = "Samsung Galaxy device in offline finding mode"
+category = "tracker"
+severity = "low"
+confidence = "medium"
+evidence = "code"
+source = "AirGuard SamsungFindMyMobile.kt: service UUID 0xFD69. Yu 2022 appendix B.2."
+notes = "A phone, watch or earbuds without a connection. It can be used as a tracker."
+[[signature.match]]
+service_uuid = "fd69"
+[[signature.match]]
+service_data_uuid = "fd69"
+
+[[signature]]
+id = "tile-tracker"
+name = "Tile tracker"
+category = "tracker"
+severity = "medium"
+confidence = "high"
+evidence = "spec"
+source = "Tile tile_lib.h: TILE_ACTIVATED_UUID 0xFEED. AirGuard Tile.kt."
+notes = "A Tile sends the same frame near and away from its owner. Some headphones and laptops have Tile built in."
+overrides = ["tile-registry-only"]
+[[signature.match]]
+service_uuid = "feed"
+[[signature.match]]
+service_data_uuid = "feed"
+
+[[signature]]
+id = "tile-not-activated"
+name = "Tile tracker, not activated"
+category = "tracker"
+severity = "info"
+confidence = "high"
+evidence = "spec"
+source = "Tile tile_lib.h: TILE_SHIPPING_UUID 0xFEEC (shipping mode)."
+notes = "A Tile without an owner account cannot report a location."
+overrides = ["tile-registry-only"]
+[[signature.match]]
+service_uuid = "feec"
+
+[[signature]]
+id = "tile-registry-only"
+name = "Tile device, probable"
+category = "tracker"
+severity = "low"
+confidence = "low"
+evidence = "registry"
+source = "Service UUID 0xFD84 and company ID 0x067C are registered to Tile, Inc. No capture shows them in a tracker frame."
+[[signature.match]]
+service_uuid = "fd84"
+[[signature.match]]
+company_id = 0x067C
+
+[[signature]]
+id = "chipolo-tracker"
+name = "Chipolo tracker"
+category = "tracker"
+severity = "medium"
+confidence = "high"
+evidence = "code"
+source = "AirGuard Chipolo.kt: service UUID 0xFE33."
+overrides = ["chipolo-registry-only"]
+[[signature.match]]
+service_uuid = "fe33"
+[[signature.match]]
+service_data_uuid = "fe33"
+
+[[signature]]
+id = "chipolo-registry-only"
+name = "Chipolo device, probable"
+category = "tracker"
+severity = "low"
+confidence = "low"
+evidence = "registry"
+source = "Service UUID 0xFE65 and company ID 0x08C3 are registered to CHIPOLO d.o.o. No capture shows them in a tracker frame."
+[[signature.match]]
+service_uuid = "fe65"
+[[signature.match]]
+company_id = 0x08C3
+
+[[signature]]
+id = "pebblebee-tracker"
+name = "Pebblebee tracker (own network)"
+category = "tracker"
+severity = "medium"
+confidence = "medium"
+evidence = "code"
+source = "AirGuard PebbleBee.kt: service UUID 0xFA25, advertised name 'PB - xxxx'."
+notes = "Pebblebee tags for Apple Find My or Google Find Hub match those rules instead. 0xFA25 is not a registered UUID, so other products can use it."
+[[signature.match]]
+service_uuid = "fa25"
+[[signature.match]]
+name_regex = "^PB - .{4}$"
+
+[[signature]]
+id = "ble-key-finder"
+name = "Bluetooth key finder (no finding network)"
+category = "tracker"
+severity = "low"
+confidence = "low"
+evidence = "code"
+source = "Theengs decoder tracker_json.h: nut (name 'nut' and service 0x180A), iTAG and Tag-It (name), Gigaset G-Tag (manufacturer data)."
+notes = "These work only in Bluetooth range of the owner's phone."
+[[signature.match]]
+name_regex = "^nut"
+service_uuid = "180a"
+[[signature.match]]
+name_regex = "^(iTAG|Tag-It)"
+[[signature.match]]
+company_id = 0x0180
+manufacturer_data_prefix = "02151234"
+
+# =========================================================== smart glasses
+
+[[signature]]
+id = "meta-smart-glasses"
+name = "Meta smart glasses (Ray-Ban or Oakley), probable"
+category = "glasses"
+severity = "high"
+confidence = "medium"
+evidence = "research"
+source = "Published captures: github.com/NullPxl/banrays (company ID 0x01AB with service 0xFD5F) and Nearby Glasses pull request 64 (0x01AB, name 'Oakley Meta ...')."
+notes = "Camera and microphones. The glasses advertise only at power-on, pairing or reconnect, so a silent scan does not show that there are none. It is not known if Quest headsets also use 0x01AB."
+overrides = ["meta-device-generic"]
+[[signature.match]]
+company_id = 0x01AB
+[[signature.match]]
+name_regex = "(?i)^(ray-?ban|oakley) ?meta|^RB Meta"
+
+[[signature]]
+id = "meta-device-generic"
+name = "Meta device (glasses or Quest headset)"
+category = "glasses"
+severity = "low"
+confidence = "low"
+evidence = "registry"
+source = "Company IDs 0x058E (Meta) and 0x0D53 (Luxottica) and service UUIDs 0xFD5F, 0xFEB7, 0xFEB8 are registered. 0x058E was seen on a Quest 2 (Nearby Glasses issue 28)."
+[[signature.match]]
+company_id = 0x058E
+[[signature.match]]
+company_id = 0x0D53
+[[signature.match]]
+service_uuid = "fd5f"
+[[signature.match]]
+service_uuid = "feb7"
+[[signature.match]]
+service_uuid = "feb8"
+
+[[signature]]
+id = "brilliant-labs-glasses"
+name = "Brilliant Labs Frame or Halo glasses"
+category = "glasses"
+severity = "high"
+confidence = "high"
+evidence = "spec"
+source = "github.com/brilliantlabsAR/frame-codebase bluetooth.c: name 'Frame XX' and the service UUID in the advertisement. Brilliant Halo Bluetooth documents: name 'Halo XX'."
+notes = "Camera and microphone."
+[[signature.match]]
+service_uuid = "7a230001-5475-a6a4-654c-8431f6ad49c4"
+[[signature.match]]
+name_regex = "^(Frame|Halo) [0-9A-F]{2}$|^Frame Update$"
+
+[[signature]]
+id = "mentra-live-glasses"
+name = "Mentra Live camera glasses"
+category = "glasses"
+severity = "high"
+confidence = "medium"
+evidence = "code"
+source = "MentraOS MentraLive connector: names and manufacturer ID 0xB822."
+notes = "Camera and microphone. 0xB822 is not a registered ID, so other products can use it."
+[[signature.match]]
+name_regex = "^Xy_A$|^XyBLE_|(?i)^mentra_live"
+[[signature.match]]
+company_id = 0xB822
+
+[[signature]]
+id = "rokid-glasses"
+name = "Rokid Glasses"
+category = "glasses"
+severity = "high"
+confidence = "low"
+evidence = "code"
+source = "Rokid CXR-M sample BluetoothHelper.kt: scan filter for service 0x9100, 'Rokid Glasses Service'."
+notes = "Camera and microphone. 0x9100 is not a registered UUID, so other products can use it."
+[[signature.match]]
+service_uuid = "9100"
+
+[[signature]]
+id = "generic-camera-glasses"
+name = "Low-cost camera glasses (HeyCyan or Da Echo app)"
+category = "glasses"
+severity = "high"
+confidence = "low"
+evidence = "code"
+source = "Nearby Glasses DetectionEvent.kt: HeyCyan service UUID, and Da Echo frame (company 0xF0EF with service data 0xFEA8)."
+[[signature.match]]
+service_uuid = "7905fff0-b5ce-4e99-a40f-4b1e122d00d0"
+[[signature.match]]
+service_data_uuid = "7905fff0-b5ce-4e99-a40f-4b1e122d00d0"
+[[signature.match]]
+name_regex = "(?i)heycyan"
+[[signature.match]]
+company_id = 0xF0EF
+service_data_uuid = "fea8"
+service_data_prefix = "413149010000"
+
+[[signature]]
+id = "even-realities-glasses"
+name = "Even Realities G1 or G2 glasses"
+category = "glasses"
+severity = "low"
+confidence = "medium"
+evidence = "code"
+source = "Gadgetbridge G1 coordinator: name pattern. MentraOS G2 connector: manufacturer data starts with ASCII 'ER' and a serial number."
+notes = "Microphones, no camera. The byte order of the 'ER' rule is not checked on a real device."
+overrides = ["even-realities-registry-only"]
+[[signature.match]]
+name_regex = "^Even G[12]_[0-9]+_[LR]_"
+[[signature.match]]
+company_id = 0x5245
+manufacturer_data_prefix = "53"
+
+[[signature]]
+id = "even-realities-registry-only"
+name = "Even Realities device, probable"
+category = "glasses"
+severity = "low"
+confidence = "low"
+evidence = "registry"
+source = "Company ID 0x10F9 is registered to Even Realities Ltd."
+[[signature.match]]
+company_id = 0x10F9
+
+[[signature]]
+id = "snap-spectacles"
+name = "Snap Spectacles, possible"
+category = "glasses"
+severity = "medium"
+confidence = "low"
+evidence = "registry"
+source = "Company ID 0x03C2 is registered to Snapchat Inc. No published capture."
+notes = "Camera glasses."
+[[signature.match]]
+company_id = 0x03C2
+[[signature.match]]
+name_regex = "(?i)^spectacles"
+
+[[signature]]
+id = "vuzix-glasses"
+name = "Vuzix smart glasses, possible"
+category = "glasses"
+severity = "low"
+confidence = "low"
+evidence = "registry"
+source = "Company ID 0x060C is registered to Vuzix Corporation. MentraOS gives the name form 'Vuzix Z100 [xxxxxx]'."
+notes = "Some Vuzix models have a camera. The Z100 has none."
+[[signature.match]]
+company_id = 0x060C
+[[signature.match]]
+name_regex = "^Vuzix "
+
+# ========================================================= audio recorders
+
+[[signature]]
+id = "plaud-recorder"
+name = "PLAUD AI voice recorder"
+category = "recorder"
+severity = "high"
+confidence = "medium"
+evidence = "code"
+source = "Omi app PLAUD connector: manufacturer ID 0x005D with NotePin payload 04 56 CF 00, service 0x1910, and names."
+notes = "PLAUD Note and NotePin record audio for transcription."
+overrides = ["plaud-registry-only"]
+[[signature.match]]
+company_id = 0x005D
+manufacturer_data_prefix = "0456cf00"
+[[signature.match]]
+service_uuid = "1910"
+[[signature.match]]
+name_regex = "(?i)^plaud|notepin"
+
+[[signature]]
+id = "plaud-registry-only"
+name = "PLAUD device, probable"
+category = "recorder"
+severity = "medium"
+confidence = "low"
+evidence = "registry"
+source = "Company ID 0x0FB2 is registered to PLAUD Inc."
+[[signature.match]]
+company_id = 0x0FB2
+
+[[signature]]
+id = "omi-wearable"
+name = "Omi AI wearable (always-on microphone), possible"
+category = "recorder"
+severity = "high"
+confidence = "low"
+evidence = "spec"
+source = "Omi firmware (BasedHardware/omi transport.c and configuration files): audio service UUID and names 'Omi', 'Omi DevKit 2', 'Friend', 'OMI Glass'."
+notes = "The UUID is also the ArduinoBLE example UUID, so hobby boards can match. 'OMI Glass' also has a camera."
+[[signature.match]]
+service_uuid = "19b10000-e8f2-537e-4f6c-d104768a1214"
+[[signature.match]]
+name_regex = "(?i)^omi( |$|-)|^Friend$"
+
+[[signature]]
+id = "limitless-pendant"
+name = "Limitless pendant (always-on microphone)"
+category = "recorder"
+severity = "high"
+confidence = "medium"
+evidence = "code"
+source = "Omi app Limitless connector: service UUID and name."
+[[signature.match]]
+service_uuid = "632de001-604c-446b-a80f-7963e950f3fb"
+[[signature.match]]
+name_regex = "(?i)limitless"
+
+[[signature]]
+id = "bee-wearable"
+name = "Bee AI wearable (always-on microphone)"
+category = "recorder"
+severity = "high"
+confidence = "medium"
+evidence = "code"
+source = "Omi app Bee connector: service UUID."
+[[signature.match]]
+service_uuid = "03d5d5c4-a86c-11ee-9d89-8f2089a49e7e"
+
+[[signature]]
+id = "friend-pendant"
+name = "Friend pendant (always-on microphone)"
+category = "recorder"
+severity = "high"
+confidence = "medium"
+evidence = "code"
+source = "Omi app Friend connector: service UUID and name prefix 'friend_'."
+[[signature.match]]
+service_uuid = "1a3fd0e7-b1f3-ac9e-2e49-b647b2c4f8da"
+[[signature.match]]
+name_regex = "(?i)^friend_"
+
+[[signature]]
+id = "fieldy-compass-recorder"
+name = "Fieldy or Compass AI recorder, by name"
+category = "recorder"
+severity = "medium"
+confidence = "low"
+evidence = "code"
+source = "Omi app Fieldy connector: names."
+[[signature.match]]
+name_regex = "(?i)^(compass|fieldy)$"
+
+[[signature]]
+id = "flock-raven"
+name = "Flock Raven gunshot detector (microphone)"
+category = "recorder"
+severity = "medium"
+confidence = "medium"
+evidence = "code"
+source = "ACAB signatures.md and flock-you main.cpp: service UUIDs 0x3100, 0x3200, 0x3300, 0x3400, 0x3500."
+[[signature.match]]
+service_uuid = "3100"
+[[signature.match]]
+service_uuid = "3200"
+[[signature.match]]
+service_uuid = "3300"
+[[signature.match]]
+service_uuid = "3400"
+[[signature.match]]
+service_uuid = "3500"
+
+# ================================================================= cameras
+
+[[signature]]
+id = "flock-penguin-battery"
+name = "Flock Safety camera battery pack"
+category = "camera"
+severity = "medium"
+confidence = "high"
+evidence = "code"
+source = "flock-you main.cpp and firmware_derived_signatures.md, ESP32 Marauder WiFiScan.cpp: names 'Penguin-<10 digits>' and 'FS Ext Battery', company ID 0x09C8 with a 10-digit name."
+notes = "A licence-plate camera is very probably near."
+overrides = ["flock-device"]
+[[signature.match]]
+name_regex = "^Penguin-[0-9]{10}$"
+[[signature.match]]
+name_regex = "(?i)^FS Ext Battery$"
+[[signature.match]]
+company_id = 0x09C8
+name_regex = "^[0-9]{10}$"
+
+[[signature]]
+id = "flock-device"
+name = "Flock Safety device, possible"
+category = "camera"
+severity = "medium"
+confidence = "low"
+evidence = "code"
+source = "flock-you: accessory service UUID and company ID 0x09C8 (XUNTONG). IEEE prefix B4:1E:52 (Flock Safety). Name 'FS-<hex>' from ACAB."
+notes = "0x09C8 is the maker of the radio module. Other products can use it."
+[[signature.match]]
+service_uuid = "e8ccbb38-9532-46a8-9fe5-1814df172e6f"
+[[signature.match]]
+company_id = 0x09C8
+[[signature.match]]
+address_prefix = "B4:1E:52"
+[[signature.match]]
+name_regex = "^FS-[0-9A-Fa-f]{4,}$"
+
+[[signature]]
+id = "gopro-camera"
+name = "GoPro camera"
+category = "camera"
+severity = "low"
+confidence = "high"
+evidence = "spec"
+source = "Open GoPro BLE specification: service UUID 0xFEA6, company ID 0x02F2, name 'GoPro NNNN'."
+notes = "The camera has power or was on in the last 8 hours. This does not show that it records."
+[[signature.match]]
+company_id = 0x02F2
+[[signature.match]]
+service_uuid = "fea6"
+[[signature.match]]
+service_data_uuid = "fea6"
+[[signature.match]]
+name_regex = "^GoPro [0-9A-Za-z]{4}$"
+
+[[signature]]
+id = "dji-osmo-camera"
+name = "DJI Osmo camera (Action 3, 4, 5 Pro or Pocket 3)"
+category = "camera"
+severity = "low"
+confidence = "medium"
+evidence = "code"
+source = "github.com/datagutt/node-osmo model.ts: company ID 0x08AA, then model bytes 1200, 1400, 1500 or 2000."
+[[signature.match]]
+company_id = 0x08AA
+manufacturer_data_prefix = "1200"
+[[signature.match]]
+company_id = 0x08AA
+manufacturer_data_prefix = "1400"
+[[signature.match]]
+company_id = 0x08AA
+manufacturer_data_prefix = "1500"
+[[signature.match]]
+company_id = 0x08AA
+manufacturer_data_prefix = "2000"
+
+[[signature]]
+id = "insta360-camera"
+name = "Insta360 camera or remote"
+category = "camera"
+severity = "low"
+confidence = "medium"
+evidence = "code"
+source = "github.com/wilds/insta360_remote_controller main.cpp: service UUID 0xBE80 or a name that contains 'Insta360'."
+[[signature.match]]
+service_uuid = "be80"
+[[signature.match]]
+name_regex = "(?i)insta360"
+
+[[signature]]
+id = "camera-vendor"
+name = "Device from a camera vendor (Hikvision, Arlo or Wyze)"
+category = "camera"
+severity = "low"
+confidence = "low"
+evidence = "registry"
+source = "Company IDs 0x0E25 (Hikvision), 0x0C19 (Arlo) and 0x0870 (Wyze) are registered. No source shows them in a camera frame."
+notes = "These vendors also make products without a camera."
+[[signature.match]]
+company_id = 0x0E25
+[[signature.match]]
+company_id = 0x0C19
+[[signature.match]]
+company_id = 0x0870
+
+[[signature]]
+id = "camera-by-name"
+name = "Camera, by name"
+category = "camera"
+severity = "low"
+confidence = "low"
+evidence = "guess"
+source = "Name patterns. No source gives the Bluetooth names of common Wi-Fi cameras. Most low-cost hidden cameras use a Wi-Fi access point for setup and no Bluetooth."
+[[signature.match]]
+name_regex = "(?i)^(wyze ?cam|tapo[-_ ]?c[0-9]|eufy ?cam|reolink|imou|ip ?cam|yi[-_ ]cam)"
+
+# =============================================================== body cams
+
+[[signature]]
+id = "axon-body-camera"
+name = "Axon body camera"
+category = "bodycam"
+severity = "medium"
+confidence = "medium"
+evidence = "code"
+source = "ACAB axon_signatures.h: 128-bit service data UUID that spells ASCII 'AXJANUSBWCDEVICE', from its field captures."
+notes = "This rule needs no MAC address, so it works on macOS. The byte order is not checked on a real device."
+overrides = ["axon-equipment"]
+[[signature.match]]
+service_data_uuid = "41584a41-4e55-5342-5743-444556494345"
+
+[[signature]]
+id = "axon-equipment"
+name = "Axon or TASER equipment (body camera, TASER, dock or vehicle unit)"
+category = "bodycam"
+severity = "medium"
+confidence = "medium"
+evidence = "code"
+source = "Service UUID 0xFE6B and company ID 0x034D are registered to TASER International. IEEE prefix 00:25:DF (Axon Enterprise), used by lookout.py and PoliceDetector. Prefix D8:1F:65 and the payload forms from ACAB field captures."
+notes = "This names the vendor, not the product. The address rules do not work on macOS."
+[[signature.match]]
+service_data_uuid = "fe6b"
+[[signature.match]]
+company_id = 0x034D
+manufacturer_data_prefix = "02"
+[[signature.match]]
+service_data_uuid = "4d455452-4f50-4f4c-4953-444556494345"
+[[signature.match]]
+address_prefix = "00:25:DF"
+[[signature.match]]
+address_prefix = "D8:1F:65"
+
+[[signature]]
+id = "utility-bodyworn"
+name = "Utility BodyWorn body-camera remote"
+category = "bodycam"
+severity = "medium"
+confidence = "medium"
+evidence = "code"
+source = "ACAB: name 'BodyWorn Remote' from a published capture. IEEE prefixes 00:09:BC and 00:16:ED (Utility, Inc)."
+[[signature.match]]
+name_regex = "BodyWorn Remote"
+[[signature.match]]
+address_prefix = "00:09:BC"
+[[signature.match]]
+address_prefix = "00:16:ED"
+
+[[signature]]
+id = "watchguard-video"
+name = "WatchGuard Video equipment (in-car or body video), possible"
+category = "bodycam"
+severity = "low"
+confidence = "low"
+evidence = "registry"
+source = "IEEE prefix 00:1D:96 (WatchGuard Video)."
+notes = "The address rule does not work on macOS."
+[[signature.match]]
+address_prefix = "00:1D:96"
+
+# =================================================================== tools
+
+[[signature]]
+id = "flipper-zero"
+name = "Flipper Zero"
+category = "tool"
+severity = "medium"
+confidence = "high"
+evidence = "spec"
+source = "flipperzero-firmware serial_profile.c: service UUID 0x3080 + colour (1 black, 2 white, 3 transparent). furi_hal_version.c: name 'Flipper <name>'. MAC prefixes from Wall of Flippers."
+notes = "A radio multi-tool. It can clone tags and send radio signals. Other firmware can change the name and the address."
+[[signature.match]]
+service_uuid = "3081"
+[[signature.match]]
+service_uuid = "3082"
+[[signature.match]]
+service_uuid = "3083"
+[[signature.match]]
+service_uuid = "3080"
+[[signature.match]]
+name_regex = "^Flipper( |$)"
+[[signature.match]]
+address_prefix = "0C:FA:22"
+[[signature.match]]
+address_prefix = "80:E1:26"
+
+# ================================================================= generic
+
+[[signature]]
+id = "tuya-ble-device"
+name = "Tuya smart device (plug, lamp, lock or camera)"
+category = "generic"
+severity = "info"
+confidence = "medium"
+evidence = "code"
+source = "github.com/PlusPlus-ua/ha_tuya_ble const.py: service data UUID 0xA201 and company ID 0x07D0."
+notes = "Tuya cameras send the same frame as all other Tuya products."
+[[signature.match]]
+service_data_uuid = "a201"
+[[signature.match]]
+company_id = 0x07D0
+
+[[signature]]
+id = "nest-device-setup"
+name = "Google Nest device in setup mode (camera, thermostat, alarm or lock)"
+category = "generic"
+severity = "info"
+confidence = "low"
+evidence = "spec"
+source = "OpenWeave: service UUID 0xFEAF (Nest Labs) and default name 'NEST-XXXX'."
+[[signature.match]]
+service_uuid = "feaf"
+[[signature.match]]
+name_regex = "^NEST-[0-9A-Fa-f]{4}$"
+
+[[signature]]
+id = "espressif-board"
+name = "ESP32 board (generic)"
+category = "generic"
+severity = "info"
+confidence = "medium"
+evidence = "registry"
+source = "Company ID 0x02E5 is registered to Espressif."
+notes = "Most are smart-home products. Self-made cameras and bugs often use this chip."
+[[signature.match]]
+company_id = 0x02E5
+[[signature.match]]
+name_regex = "(?i)^esp(32|_|-)"
+
+[[signature]]
+id = "ble-serial-module"
+name = "Bluetooth serial module (self-made device)"
+category = "generic"
+severity = "info"
+confidence = "low"
+evidence = "guess"
+source = "Default names of the HM-10 (HMSoft) and HC-08 modules."
+notes = "Common in hobby projects. Card skimmers found in the field used Bluetooth Classic modules, which this tool cannot see."
+[[signature.match]]
+name_regex = "^(HMSoft|HC-08)$"
