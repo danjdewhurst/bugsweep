@@ -38,12 +38,16 @@ the tool with `cargo install cargo-llvm-cov` (or `brew install cargo-llvm-cov`)
 and `rustup component add llvm-tools-preview`.
 
 The coverage check skips one file: `src/hardware.rs`. It holds the only code
-that needs a Bluetooth adapter, a network to sweep or an interactive terminal:
-the btleplug calls and their event mapping, the real sweep, and the terminal
-setup and key reader. No test checks that code, so keep each function there
-short and plain. Put logic in the other modules, where tests
-reach it through fakes: `cli::Hardware`, `ble::Radio`, `lan::Probe` and the
-command runner in `place.rs`.
+that needs a Bluetooth adapter, a network to sweep, an interactive terminal or
+a desktop window: the btleplug calls and their event mapping, the real sweep,
+the terminal setup and key reader, and the window setup. No test checks that
+code, so keep each function there short and plain. Put logic in the other
+modules, where tests reach it through fakes: `cli::Hardware`, `ble::Radio`,
+`lan::Probe` and the command runner in `place.rs`.
+
+The tests of the window in `src/gui.rs` use
+[egui_kittest](https://docs.rs/egui_kittest), which draws each frame without a
+real window and finds the widgets through their accessibility labels.
 
 ## Commit messages
 

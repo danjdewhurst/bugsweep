@@ -1,14 +1,16 @@
-//! The real Bluetooth adapter, network and terminal.
+//! The real Bluetooth adapter, network, terminal and window.
 //!
-//! This is the only code that needs a Bluetooth adapter, a network to sweep
-//! or an interactive terminal, so the tests cannot run it and the coverage
-//! check skips this file. Keep each function here short, and put all logic
+//! This is the only code that needs a Bluetooth adapter, a network to sweep,
+//! an interactive terminal or a desktop window, so the tests cannot run it
+//! and the coverage check skips this file. Keep each function here short, and put all logic
 //! in the other modules, where tests reach it through fakes.
 
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::mpsc::Receiver;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use btleplug::api::{Central, CentralEvent, CentralState, Manager as _, Peripheral as _, ScanFilter};
 use btleplug::platform::{Adapter, Manager, PeripheralId};
 use futures::future::BoxFuture;
@@ -18,6 +20,7 @@ use ratatui::crossterm::event::{self, Event, KeyEvent};
 
 use crate::ble::{self, BleEvent, Radio, Signal};
 use crate::cli::Hardware;
+use crate::gui::{self, Gui, Live};
 use crate::lan::{self, LanReport};
 use crate::model::Advert;
 use crate::session::Session;
@@ -40,6 +43,33 @@ impl Hardware for Machine {
         let result = tui::run(&mut terminal, session, events, start_lan, &mut read_key);
         ratatui::restore();
         result
+    }
+
+    fn window(&self, session: Session, events: Receiver<AppEvent>, start_lan: &dyn Fn()) -> Result<()> {
+        let live = Arc::new(Mutex::new(Live::new(session)));
+        let pump_live = Arc::clone(&live);
+        // The thread keeps the session current also while the window draws nothing.
+        std::thread::spawn(move || {
+            if panic::catch_unwind(AssertUnwindSafe(|| gui::pump(events, &pump_live))).is_err() {
+                gui::fail(&pump_live, "the event thread stopped; restart bugsweep");
+            }
+        });
+        let gui = Gui::new(live, start_lan);
+        let options = eframe::NativeOptions {
+            viewport: eframe::egui::ViewportBuilder::default()
+                .with_title("bugsweep")
+                .with_inner_size([1180.0, 720.0])
+                .with_min_inner_size([720.0, 420.0]),
+            ..Default::default()
+        };
+        eframe::run_native("bugsweep", options, Box::new(|_| Ok(Box::new(gui))))
+            .map_err(|error| anyhow!("cannot open the window: {error}"))
+    }
+}
+
+impl eframe::App for Gui<'_> {
+    fn update(&mut self, ctx: &eframe::egui::Context, _frame: &mut eframe::Frame) {
+        self.show(ctx);
     }
 }
 

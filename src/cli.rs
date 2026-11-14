@@ -32,6 +32,9 @@ pub trait Hardware: Sync {
     /// Run the terminal interface until the user quits. `start_lan` starts
     /// one network sweep, whose result arrives as `AppEvent::Lan`.
     fn terminal(&self, session: Session, events: Receiver<AppEvent>, start_lan: &dyn Fn()) -> Result<()>;
+    /// Run the desktop window until the user closes it. `start_lan` works
+    /// as for [`Hardware::terminal`].
+    fn window(&self, session: Session, events: Receiver<AppEvent>, start_lan: &dyn Fn()) -> Result<()>;
 }
 
 /// A radio check for trackers, cameras, recorders and smart glasses.
@@ -85,6 +88,8 @@ enum Cmd {
     Followers,
     /// List the signature database.
     Signatures,
+    /// Open the desktop window.
+    Gui,
 }
 
 /// Standard output and standard error of a command.
@@ -115,9 +120,13 @@ pub fn run(args: Vec<OsString>, hardware: &dyn Hardware, io: Output) -> Result<(
             let session = new_session(&cli, db)?;
             run_scan(hardware, session, *seconds, *json, *flagged, io)
         }
+        Some(Cmd::Gui) => {
+            let session = new_session(&cli, db)?;
+            run_interactive(hardware, session, Front::Window)
+        }
         None => {
             let session = new_session(&cli, db)?;
-            run_tui(hardware, session)
+            run_interactive(hardware, session, Front::Terminal)
         }
     }
 }
@@ -147,7 +156,13 @@ fn runtime() -> Result<tokio::runtime::Runtime> {
         .context("cannot start the async runtime")
 }
 
-fn run_tui(hardware: &dyn Hardware, session: Session) -> Result<()> {
+/// Where an interactive session shows its devices.
+enum Front {
+    Terminal,
+    Window,
+}
+
+fn run_interactive(hardware: &dyn Hardware, session: Session, front: Front) -> Result<()> {
     let runtime = runtime()?;
     let (tx, rx) = mpsc::channel::<AppEvent>();
 
@@ -164,7 +179,10 @@ fn run_tui(hardware: &dyn Hardware, session: Session) -> Result<()> {
         });
     };
 
-    let result = hardware.terminal(session, rx, &start_lan);
+    let result = match front {
+        Front::Terminal => hardware.terminal(session, rx, &start_lan),
+        Front::Window => hardware.window(session, rx, &start_lan),
+    };
     runtime.shutdown_timeout(Duration::from_millis(300));
     result
 }
@@ -459,6 +477,13 @@ mod tests {
             *self.seen.lock().unwrap() = seen;
             Ok(())
         }
+
+        /// The same as the terminal, and then a mark that the window ran.
+        fn window(&self, session: Session, events: Receiver<AppEvent>, start_lan: &dyn Fn()) -> Result<()> {
+            self.terminal(session, events, start_lan)?;
+            self.seen.lock().unwrap().push("window".into());
+            Ok(())
+        }
     }
 
     fn command_line(args: &[&str]) -> Vec<OsString> {
@@ -616,6 +641,16 @@ mod tests {
         assert_eq!(
             *fake.seen.lock().unwrap(),
             ["failed gone", "lan error no private IPv4 network found", "power false", "place desk"]
+        );
+    }
+
+    #[test]
+    fn window_gets_bluetooth_and_network_events() {
+        let fake = Fake::new(|| vec![BleEvent::Started("fake".into()), BleEvent::Advert(airtag())]);
+        run_with(&fake, &["--no-log", "--place", "desk", "gui"]).unwrap();
+        assert_eq!(
+            *fake.seen.lock().unwrap(),
+            ["advert tag-1", "lan 0 hosts", "started fake", "place desk", "window"]
         );
     }
 

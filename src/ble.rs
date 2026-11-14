@@ -84,7 +84,9 @@ pub(crate) fn advert(id: String, props: PeripheralProperties) -> Advert {
         id,
         address,
         name: [props.local_name, props.advertisement_name].into_iter().flatten().find(|n| !n.is_empty()),
-        rssi: props.rssi,
+        // CoreBluetooth reports 127 when it has no value. A real advert
+        // arrives below 0 dBm.
+        rssi: props.rssi.filter(|rssi| *rssi < 0),
         tx_power: props.tx_power_level,
         manufacturer_data: props.manufacturer_data.into_iter().collect(),
         service_data: props.service_data.into_iter().collect(),
@@ -234,5 +236,16 @@ mod tests {
         assert_eq!(hidden.address, None);
         assert_eq!(hidden.name.as_deref(), Some("Local"));
         assert_eq!(advert("id-3".into(), PeripheralProperties::default()).name, None);
+    }
+
+    #[test]
+    fn rssi_without_a_value_is_dropped() {
+        let rssi = |value| {
+            advert("id".into(), PeripheralProperties { rssi: Some(value), ..Default::default() }).rssi
+        };
+        // CoreBluetooth sends 127 when the value is not available.
+        assert_eq!(rssi(127), None);
+        assert_eq!(rssi(0), None);
+        assert_eq!(rssi(-1), Some(-1));
     }
 }

@@ -1,5 +1,5 @@
 [alias]
 # Line coverage of the tests, which must stay at 100%. Needs cargo-llvm-cov.
-# src/hardware.rs holds the code that needs a Bluetooth adapter, a network
-# or a real terminal, so the tests cannot run it.
+# src/hardware.rs holds the code that needs a Bluetooth adapter, a network,
+# a real terminal or a desktop window, so the tests cannot run it.
 coverage = ["llvm-cov", "--ignore-filename-regex", "(^|[/\\\\])src[/\\\\]hardware\\.rs$", "--fail-under-lines", "100", "--show-missing-lines"]

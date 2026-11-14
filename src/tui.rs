@@ -14,10 +14,10 @@ use ratatui::widgets::{Block, Cell, Gauge, Paragraph, Row, Sparkline, Table, Tab
 use ratatui::{Frame, Terminal};
 
 use crate::ble::BleEvent;
-use crate::lan::{LanHost, LanReport, Verdict};
+use crate::identity::Basis;
+use crate::lan::{LanHost, LanReport, Neighbour, Verdict};
 use crate::model::uuid_label;
-use crate::session::follow_text;
-use crate::session::{Device, Session};
+use crate::session::{Device, Follow, Session, follow_text};
 use crate::signatures::Level;
 use crate::store::Follower;
 use crate::vendors;
@@ -28,9 +28,10 @@ pub enum AppEvent {
 }
 
 /// A device that was silent for this time shows dim.
-const STALE_AFTER: Duration = Duration::from_secs(30);
-const TICK: Duration = Duration::from_millis(200);
-const FINDER_SAMPLES: usize = 120;
+pub(crate) const STALE_AFTER: Duration = Duration::from_secs(30);
+/// Time between two finder samples, and between two redraws.
+pub(crate) const TICK: Duration = Duration::from_millis(200);
+pub(crate) const FINDER_SAMPLES: usize = 120;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum View {
@@ -353,14 +354,7 @@ impl<'a> App<'a> {
     fn device_row(&self, device: &Device) -> Row<'static> {
         let level = self.session.level(device);
         let signature = self.session.top_signature(device);
-        let mut finding = signature.map(|sig| sig.name.clone()).unwrap_or_default();
-        if let Some(follow) = device.follow() {
-            let follow = follow_text(follow);
-            finding = if finding.is_empty() { follow } else { format!("{finding}; {follow}") };
-        }
-        if device.known {
-            finding = if finding.is_empty() { "known".into() } else { format!("known · {finding}") };
-        }
+        let finding = finding_text(&self.session, device);
         let signal = match device.rssi_avg {
             Some(rssi) => format!("{} {:>4.0} dBm", bar(signal_percent(rssi), 8), rssi),
             None => String::new(),
@@ -384,7 +378,6 @@ impl<'a> App<'a> {
     }
 
     fn detail_lines(&self, device: &Device) -> Vec<Line<'static>> {
-        let advert = &device.advert;
         let mut lines = Vec::new();
         let field = |label: &str, value: String| {
             Line::from(vec![Span::from(format!("{label:<11}")).dim(), Span::from(value)])
@@ -404,49 +397,13 @@ impl<'a> App<'a> {
             lines.push(Line::from(format!("     Source: {}", sig.source)).dim());
         }
         if let Some(follow) = device.follow() {
-            let caution = match follow.basis {
-                crate::identity::Basis::Name => " A different device of the same model can have this name.",
-                crate::identity::Basis::Data => " A different device of the same model can send this data.",
-                _ => "",
-            };
-            lines.push(
-                Line::from(format!(
-                    "This device was {}.{caution} Press m if it is yours.",
-                    follow_text(follow)
-                ))
-                .yellow(),
-            );
+            lines.push(Line::from(format!("{} Press m if it is yours.", follow_warning(follow))).yellow());
         }
         if device.hits.is_empty() && device.follow().is_none() {
             lines.push(Line::from("No finding for this device.").dim());
         }
 
-        let name = advert.name.clone().unwrap_or_else(|| "(no name)".into());
-        lines.push(field("Name", name));
-        let id = match &advert.address {
-            Some(address) => format!("{address}  ({})", advert.id),
-            None => format!("{}  (the system hides the address)", advert.id),
-        };
-        lines.push(field("ID", id));
-        for (company, data) in &advert.manufacturer_data {
-            let vendor = vendors::company(*company).unwrap_or("unknown company");
-            lines.push(field("Maker data", format!("{company:#06x} {vendor}: {}", hex_short(data, 24))));
-        }
-        for uuid in &advert.services {
-            lines.push(field("Service", with_owner(uuid)));
-        }
-        for (uuid, data) in &advert.service_data {
-            lines.push(field("Svc data", format!("{}: {}", with_owner(uuid), hex_short(data, 24))));
-        }
-        lines.push(field(
-            "Stats",
-            format!(
-                "{} updates, first seen {} ago{}",
-                device.updates,
-                format_age(device.first_seen.elapsed()),
-                advert.tx_power.map(|p| format!(", TX power {p} dBm")).unwrap_or_default()
-            ),
-        ));
+        lines.extend(detail_fields(device).into_iter().map(|(label, value)| field(label, value)));
         lines
     }
 
@@ -471,15 +428,7 @@ impl<'a> App<'a> {
         let finding = self.session.top_signature(device).map(|sig| sig.name.clone()).unwrap_or_default();
         frame.render_widget(Paragraph::new(vec![Line::from(name).bold(), Line::from(finding)]), title);
 
-        let stale = device.age() > Duration::from_secs(5);
-        let percent = device.rssi_avg.map(signal_percent).unwrap_or(0);
-        let label = match (device.rssi_avg, device.distance_m()) {
-            _ if stale => format!("no signal for {}", format_age(device.age())),
-            (Some(rssi), Some(distance)) => {
-                format!("{rssi:.0} dBm   about {}", format_distance(distance))
-            }
-            _ => "no signal value".into(),
-        };
+        let FinderReading { stale, percent, label } = FinderReading::of(device);
         let colour = match percent {
             _ if stale => Color::DarkGray,
             70.. => Color::Red,
@@ -572,17 +521,11 @@ impl<'a> App<'a> {
                     summary,
                 );
                 let other_rows = report.others.iter().filter(|_| self.lan_show_all).map(|other| {
-                    let detail = match (&other.vendor, other.note) {
-                        (Some(vendor), Some(note)) => format!("{vendor} ({note})"),
-                        (Some(vendor), None) => vendor.clone(),
-                        (None, Some(note)) => note.to_string(),
-                        (None, None) => "unknown vendor".to_string(),
-                    };
                     Row::new([
                         Cell::from(""),
                         Cell::from(other.ip.to_string()),
                         Cell::from(other.mac.clone()),
-                        Cell::from(detail),
+                        Cell::from(neighbour_detail(other)),
                     ])
                 });
                 let rows = report.hosts.iter().map(|host| {
@@ -669,7 +612,7 @@ impl<'a> App<'a> {
 
 // ---------------------------------------------------------------- helpers
 
-fn level_tag(level: Level) -> &'static str {
+pub(crate) fn level_tag(level: Level) -> &'static str {
     match level {
         Level::High => "HIGH",
         Level::Medium => "MED",
@@ -726,6 +669,95 @@ fn with_owner(uuid: &uuid::Uuid) -> String {
     match vendors::uuid_owner(uuid) {
         Some(owner) => format!("{} ({owner})", uuid_label(uuid)),
         None => uuid_label(uuid),
+    }
+}
+
+/// The finding column of the device list: the top signature, the other
+/// places and the "known" mark.
+pub(crate) fn finding_text(session: &Session, device: &Device) -> String {
+    let mut finding = session.top_signature(device).map(|sig| sig.name.clone()).unwrap_or_default();
+    if let Some(follow) = device.follow() {
+        let follow = follow_text(follow);
+        finding = if finding.is_empty() { follow } else { format!("{finding}; {follow}") };
+    }
+    if device.known {
+        finding = if finding.is_empty() { "known".into() } else { format!("known · {finding}") };
+    }
+    finding
+}
+
+/// "This device was seen at 2 other place(s), same name. A different device
+/// of the same model can have this name."
+pub(crate) fn follow_warning(follow: Follow) -> String {
+    let caution = match follow.basis {
+        Basis::Name => " A different device of the same model can have this name.",
+        Basis::Data => " A different device of the same model can send this data.",
+        _ => "",
+    };
+    format!("This device was {}.{caution}", follow_text(follow))
+}
+
+/// The raw data of a device, as label and value pairs.
+pub(crate) fn detail_fields(device: &Device) -> Vec<(&'static str, String)> {
+    let advert = &device.advert;
+    let mut fields = vec![("Name", advert.name.clone().unwrap_or_else(|| "(no name)".into()))];
+    let id = match &advert.address {
+        Some(address) => format!("{address}  ({})", advert.id),
+        None => format!("{}  (the system hides the address)", advert.id),
+    };
+    fields.push(("ID", id));
+    for (company, data) in &advert.manufacturer_data {
+        let vendor = vendors::company(*company).unwrap_or("unknown company");
+        fields.push(("Maker data", format!("{company:#06x} {vendor}: {}", hex_short(data, 24))));
+    }
+    for uuid in &advert.services {
+        fields.push(("Service", with_owner(uuid)));
+    }
+    for (uuid, data) in &advert.service_data {
+        fields.push(("Svc data", format!("{}: {}", with_owner(uuid), hex_short(data, 24))));
+    }
+    fields.push((
+        "Stats",
+        format!(
+            "{} updates, first seen {} ago{}",
+            device.updates,
+            format_age(device.first_seen.elapsed()),
+            advert.tx_power.map(|p| format!(", TX power {p} dBm")).unwrap_or_default()
+        ),
+    ));
+    fields
+}
+
+/// What the finder shows for one device.
+pub(crate) struct FinderReading {
+    /// No signal for some seconds.
+    pub stale: bool,
+    pub percent: u16,
+    pub label: String,
+}
+
+impl FinderReading {
+    pub(crate) fn of(device: &Device) -> Self {
+        let stale = device.age() > Duration::from_secs(5);
+        let percent = device.rssi_avg.map(signal_percent).unwrap_or(0);
+        let label = match (device.rssi_avg, device.distance_m()) {
+            _ if stale => format!("no signal for {}", format_age(device.age())),
+            (Some(rssi), Some(distance)) => {
+                format!("{rssi:.0} dBm   about {}", format_distance(distance))
+            }
+            _ => "no signal value".into(),
+        };
+        FinderReading { stale, percent, label }
+    }
+}
+
+/// The vendor and note of a network host without camera evidence.
+pub(crate) fn neighbour_detail(other: &Neighbour) -> String {
+    match (&other.vendor, other.note) {
+        (Some(vendor), Some(note)) => format!("{vendor} ({note})"),
+        (Some(vendor), None) => vendor.clone(),
+        (None, Some(note)) => note.to_string(),
+        (None, None) => "unknown vendor".to_string(),
     }
 }
 
