@@ -86,14 +86,8 @@ pub struct Session {
 
 impl Session {
     pub fn new(db: Arc<SignatureDb>, store: Option<Store>, place: String) -> Self {
-        let mut session = Session {
-            db,
-            store,
-            place,
-            devices: HashMap::new(),
-            known: HashSet::new(),
-            store_error: None,
-        };
+        let mut session =
+            Session { db, store, place, devices: HashMap::new(), known: HashSet::new(), store_error: None };
         if let Some(store) = &session.store {
             match store.known_keys() {
                 Ok(keys) => session.known = keys,
@@ -189,8 +183,9 @@ impl Session {
         let mut follow: Option<Follow> = None;
         let mut result = Ok(());
         for key in &keys {
-            result = result
-                .and_then(|()| store.record(&key.text, &self.place, device.advert.rssi, title.as_deref(), signature));
+            result = result.and_then(|()| {
+                store.record(&key.text, &self.place, device.advert.rssi, title.as_deref(), signature)
+            });
             // A device that is known through one key is known through all.
             if device.known && self.known.insert(key.text.clone()) {
                 result = result.and_then(|()| store.set_known(&key.text, title.as_deref(), true));
@@ -267,11 +262,8 @@ impl Session {
 
     /// Devices in display order: flagged first, then by level, then by signal.
     pub fn sorted(&self, include_unflagged: bool) -> Vec<&Device> {
-        let mut list: Vec<&Device> = self
-            .devices
-            .values()
-            .filter(|device| include_unflagged || self.is_flagged(device))
-            .collect();
+        let mut list: Vec<&Device> =
+            self.devices.values().filter(|device| include_unflagged || self.is_flagged(device)).collect();
         list.sort_by(|a, b| {
             let key = |d: &Device| {
                 (

@@ -1,10 +1,12 @@
 //! A laptop has no GPS. The MAC address of the default gateway identifies
 //! the network, and the network identifies the place.
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::Command;
 
 pub const UNKNOWN: &str = "unknown";
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn output(program: &str, args: &[&str]) -> Option<String> {
     let out = Command::new(program).args(args).output().ok()?;
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
@@ -26,11 +28,7 @@ pub fn normalise_mac(mac: &str) -> Option<String> {
 #[cfg(target_os = "macos")]
 fn gateway_mac() -> Option<String> {
     let route = output("route", &["-n", "get", "default"])?;
-    let gateway = route
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("gateway:"))?
-        .trim()
-        .to_string();
+    let gateway = route.lines().find_map(|line| line.trim().strip_prefix("gateway:"))?.trim().to_string();
     let arp = output("arp", &["-n", &gateway])?;
     let mac = arp.split_whitespace().skip_while(|word| *word != "at").nth(1)?;
     normalise_mac(mac)

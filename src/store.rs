@@ -45,11 +45,10 @@ pub fn default_path() -> Option<PathBuf> {
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("cannot create {}", parent.display()))?;
+            std::fs::create_dir_all(parent).with_context(|| format!("cannot create {}", parent.display()))?;
         }
-        let conn = Connection::open(path)
-            .with_context(|| format!("cannot open database {}", path.display()))?;
+        let conn =
+            Connection::open(path).with_context(|| format!("cannot open database {}", path.display()))?;
         // The log gets many small writes. WAL keeps them cheap.
         conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
         let store = Self::init(conn).with_context(|| format!("database {}", path.display()))?;
