@@ -397,7 +397,8 @@ mod tests {
     struct Fake {
         ble: fn() -> Vec<BleEvent>,
         /// After the events, send adverts until the receiver stops, as a
-        /// real radio in a busy room does.
+        /// real radio in a busy room does. The fake stops after 10 s, so a
+        /// scan without a deadline fails its test and does not hang it.
         endless: bool,
         lan: fn() -> Result<LanReport>,
         /// What the fake terminal received.
@@ -431,7 +432,9 @@ mod tests {
             let (events, endless) = ((self.ble)(), self.endless);
             async move {
                 events.into_iter().for_each(|event| _ = emit(event));
-                while endless && emit(BleEvent::Advert(advert("busy", None, Some(-70)))) {
+                let mut left = if endless { 1000 } else { 0 };
+                while left > 0 && emit(BleEvent::Advert(advert("busy", None, Some(-70)))) {
+                    left -= 1;
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             }

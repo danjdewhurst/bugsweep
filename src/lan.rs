@@ -25,7 +25,7 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
-use crate::place::{normalise_mac, output};
+use crate::place::{normalise_mac, output_any_status};
 use crate::vendors;
 
 /// First pass over all addresses. Short, because most addresses are empty.
@@ -354,11 +354,6 @@ async fn onvif_discover(local: Ipv4Addr, target: SocketAddr, wait: Duration) -> 
     found
 }
 
-/// Read the ARP table text of the operating system.
-fn arp_text() -> Option<String> {
-    output("arp", if cfg!(windows) { &["-a"] } else { &["-an"] })
-}
-
 /// Parse an ARP table: IP address to MAC address.
 fn parse_arp(text: &str) -> BTreeMap<Ipv4Addr, String> {
     // macOS and Linux: "? (192.168.1.1) at a4:b:c:d:e:f on en0 ..."
@@ -409,7 +404,10 @@ impl Probe for System {
     }
 
     fn arp_table(&self) -> BTreeMap<Ipv4Addr, String> {
-        parse_arp(&arp_text().unwrap_or_default())
+        // Some arp tools print a good table and still fail, so the exit
+        // status does not matter.
+        let args: &[&str] = if cfg!(windows) { &["-a"] } else { &["-an"] };
+        parse_arp(&output_any_status("arp", args).unwrap_or_default().1)
     }
 
     async fn open_ports(&self, targets: Vec<(Ipv4Addr, u16)>, wait: Duration) -> Vec<(Ipv4Addr, u16)> {
@@ -754,23 +752,30 @@ mod tests {
         assert_eq!(found[&Ipv4Addr::LOCALHOST].name.as_deref(), Some("Cam"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn onvif_discovery_ends_while_a_host_still_sends() {
-        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let addr = socket.local_addr().unwrap();
-        tokio::spawn(async move {
-            let mut buffer = [0u8; 4096];
-            let (_, from) = socket.recv_from(&mut buffer).await.unwrap();
-            let answer =
-                b"<d:ProbeMatch><d:Scopes>onvif://www.onvif.org/name/Flood</d:Scopes></d:ProbeMatch>";
-            loop {
-                let _ = socket.send_to(answer, from).await;
-                tokio::task::yield_now().await;
-            }
-        });
-        let started = Instant::now();
-        let found = onvif_discover(Ipv4Addr::LOCALHOST, addr, Duration::from_millis(300)).await;
-        assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
+        // A thread sends answers without a pause, so the socket of the
+        // discovery is always readable.
+        let flood = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = flood.local_addr().unwrap();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sender = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut buffer = [0u8; 4096];
+                let (_, from) = flood.recv_from(&mut buffer).unwrap();
+                let answer =
+                    b"<d:ProbeMatch><d:Scopes>onvif://www.onvif.org/name/Flood</d:Scopes></d:ProbeMatch>";
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = flood.send_to(answer, from);
+                }
+            })
+        };
+        let discovery = onvif_discover(Ipv4Addr::LOCALHOST, addr, Duration::from_millis(300));
+        let result = timeout(Duration::from_secs(5), discovery).await;
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        sender.join().unwrap();
+        let found = result.expect("discovery must end at its deadline");
         assert_eq!(found[&Ipv4Addr::LOCALHOST].name.as_deref(), Some("Flood"));
     }
 

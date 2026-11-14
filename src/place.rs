@@ -9,11 +9,17 @@ pub const UNKNOWN: &str = "unknown";
 pub(crate) type Runner<'a> = &'a dyn Fn(&str, &[&str]) -> Option<String>;
 
 /// Run a program and return its standard output, or `None` when it cannot
-/// start. The exit status does not matter: some tools print good data and
-/// still fail, and the parsers reject output that is not good.
+/// start or fails.
 pub(crate) fn output(program: &str, args: &[&str]) -> Option<String> {
+    let (success, stdout) = output_any_status(program, args)?;
+    success.then_some(stdout)
+}
+
+/// Run a program and return whether it succeeded and its standard output,
+/// or `None` when it cannot start.
+pub(crate) fn output_any_status(program: &str, args: &[&str]) -> Option<(bool, String)> {
     let out = Command::new(program).args(args).output().ok()?;
-    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    Some((out.status.success(), String::from_utf8_lossy(&out.stdout).into_owned()))
 }
 
 /// Pad each MAC octet to two digits. macOS prints "a:b:c:1:2:3".
@@ -139,7 +145,9 @@ mod tests {
     #[test]
     fn output_of_real_programs() {
         assert_eq!(output("sh", &["-c", "echo hello"]).as_deref(), Some("hello\n"));
-        assert_eq!(output("sh", &["-c", "echo partial; exit 3"]).as_deref(), Some("partial\n"));
+        assert_eq!(output("sh", &["-c", "echo partial; exit 3"]), None);
+        let partial = output_any_status("sh", &["-c", "echo partial; exit 3"]);
+        assert_eq!(partial, Some((false, "partial\n".to_string())));
         assert_eq!(output("bugsweep-no-such-program", &[]), None);
     }
 }
