@@ -18,6 +18,8 @@ use crate::place::UNKNOWN;
 const SCHEMA_VERSION: i64 = 1;
 /// Sightings older than this are deleted when the log opens.
 const RETENTION_DAYS: i64 = 90;
+/// Counts the `device_id` column of schema version 0.
+const OLD_LAYOUT_QUERY: &str = "SELECT COUNT(*) FROM pragma_table_info('sightings') WHERE name = 'device_id'";
 
 pub struct Store {
     conn: Connection,
@@ -67,11 +69,7 @@ impl Store {
         }
         if version == 0 {
             // Version 0 used the platform ID in a `device_id` column.
-            let old_layout: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM pragma_table_info('sightings') WHERE name = 'device_id'",
-                [],
-                |row| row.get(0),
-            )?;
+            let old_layout: i64 = conn.query_row(OLD_LAYOUT_QUERY, [], |row| row.get(0))?;
             if old_layout > 0 {
                 conn.execute_batch(
                     "BEGIN;
@@ -104,6 +102,13 @@ impl Store {
              PRAGMA user_version = {SCHEMA_VERSION};"
         ))?;
         Ok(Store { conn })
+    }
+
+    /// Drop the tables, so that each later call fails. For tests of the
+    /// error paths.
+    #[cfg(test)]
+    pub(crate) fn break_for_tests(&self) {
+        self.conn.execute_batch("DROP TABLE sightings; DROP TABLE known;").unwrap();
     }
 
     fn prune(&self) -> Result<()> {
@@ -182,21 +187,7 @@ impl Store {
              HAVING COUNT(DISTINCT s.place) >= 2
              ORDER BY COUNT(DISTINCT s.place) DESC, MAX(s.last_seen) DESC",
         )?;
-        let rows = stmt.query_map(params![UNKNOWN], |row| {
-            let key: String = row.get(0)?;
-            let places: String = row.get(3)?;
-            let mut places: Vec<String> = places.split(',').map(str::to_string).collect();
-            places.sort();
-            Ok(Follower {
-                basis: Basis::of_key(&key),
-                key,
-                title: row.get(1)?,
-                signature: row.get(2)?,
-                places,
-                first_seen: row.get(4)?,
-                last_seen: row.get(5)?,
-            })
-        })?;
+        let rows = stmt.query_map(params![UNKNOWN], follower_from_row)?;
         let mut all: Vec<Follower> = rows.collect::<rusqlite::Result<_>>()?;
         // The sort is stable, so rows of one basis keep the order of the query.
         all.sort_by_key(|f| std::cmp::Reverse(f.basis));
@@ -210,6 +201,23 @@ impl Store {
         }
         Ok(kept)
     }
+}
+
+/// One row of the follower query in `Store::followers`.
+fn follower_from_row(row: &rusqlite::Row) -> rusqlite::Result<Follower> {
+    let key: String = row.get(0)?;
+    let places: String = row.get(3)?;
+    let mut places: Vec<String> = places.split(',').map(str::to_string).collect();
+    places.sort();
+    Ok(Follower {
+        basis: Basis::of_key(&key),
+        key,
+        title: row.get(1)?,
+        signature: row.get(2)?,
+        places,
+        first_seen: row.get(4)?,
+        last_seen: row.get(5)?,
+    })
 }
 
 #[cfg(test)]
@@ -324,6 +332,61 @@ mod tests {
         // A second open of an upgraded log changes nothing.
         let store = Store::init(store.conn).unwrap();
         assert_eq!(store.other_places("id:abc", "office").unwrap(), 1);
+    }
+
+    #[test]
+    fn default_path_is_in_the_data_directory() {
+        let path = default_path().unwrap();
+        assert!(path.ends_with(Path::new("bugsweep").join("bugsweep.db")), "{}", path.display());
+    }
+
+    #[test]
+    fn open_creates_the_directory_and_keeps_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a").join("b").join("log.db");
+        Store::open(&path).unwrap().record("id:tag", "home", None, None, None).unwrap();
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.other_places("id:tag", "office").unwrap(), 1);
+    }
+
+    #[test]
+    fn open_reports_a_path_that_cannot_hold_a_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("file");
+        std::fs::write(&file, "x").unwrap();
+        let error = Store::open(&file.join("log.db")).err().unwrap();
+        assert!(format!("{error:#}").contains("cannot create"), "{error:#}");
+        // The root directory has no parent, and it is not a database.
+        let error = Store::open(Path::new("/")).err().unwrap();
+        assert!(format!("{error:#}").contains("database"), "{error:#}");
+        // A log from a newer version names its path.
+        let newer = dir.path().join("newer.db");
+        Connection::open(&newer).unwrap().execute_batch("PRAGMA user_version = 99;").unwrap();
+        let error = format!("{:#}", Store::open(&newer).err().unwrap());
+        assert!(error.contains("newer.db") && error.contains("newer version"), "{error}");
+    }
+
+    #[test]
+    fn calls_on_a_broken_log_fail() {
+        let store = Store::in_memory().unwrap();
+        store.break_for_tests();
+        assert!(store.record("id:tag", "home", None, None, None).is_err());
+        assert!(store.other_places("id:tag", "home").is_err());
+        assert!(store.set_known("id:tag", None, true).is_err());
+        assert!(store.set_known("id:tag", None, false).is_err());
+        assert!(store.known_keys().is_err());
+        assert!(store.followers().is_err());
+        assert!(store.prune().is_err());
+    }
+
+    #[test]
+    fn read_only_new_log_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.db");
+        std::fs::write(&path, "").unwrap();
+        let conn = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let error = format!("{:#}", Store::init(conn).err().unwrap());
+        assert!(error.contains("readonly"), "{error}");
     }
 
     #[test]

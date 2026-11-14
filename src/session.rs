@@ -1,6 +1,7 @@
 //! One scan session: the live device list, the classification of each
 //! device, and the link to the local log.
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -118,32 +119,34 @@ impl Session {
         self.ingest_at(advert, Instant::now());
     }
 
-    fn ingest_at(&mut self, mut advert: Advert, now: Instant) {
+    /// Take in the advertisement data of one device, received at `now`.
+    pub(crate) fn ingest_at(&mut self, mut advert: Advert, now: Instant) {
         let hits = self.db.classify(&advert);
-        let id = advert.id.clone();
-
-        if let Some(device) = self.devices.get_mut(&id) {
-            if advert.name.is_none() {
-                advert.name = device.advert.name.take();
+        let device = match self.devices.entry(advert.id.clone()) {
+            Entry::Occupied(entry) => {
+                let device = entry.into_mut();
+                if advert.name.is_none() {
+                    advert.name = device.advert.name.take();
+                }
+                if let Some(rssi) = advert.rssi {
+                    let rssi = rssi as f32;
+                    device.rssi_avg = Some(match device.rssi_avg {
+                        Some(avg) => avg + RSSI_ALPHA * (rssi - avg),
+                        None => rssi,
+                    });
+                }
+                let payload_changed = advert.manufacturer_data != device.advert.manufacturer_data
+                    || advert.service_data != device.advert.service_data;
+                if payload_changed {
+                    device.payload_since = now;
+                }
+                device.advert = advert;
+                device.hits = hits;
+                device.last_seen = now;
+                device.updates += 1;
+                device
             }
-            if let Some(rssi) = advert.rssi {
-                let rssi = rssi as f32;
-                device.rssi_avg = Some(match device.rssi_avg {
-                    Some(avg) => avg + RSSI_ALPHA * (rssi - avg),
-                    None => rssi,
-                });
-            }
-            let payload_changed = advert.manufacturer_data != device.advert.manufacturer_data
-                || advert.service_data != device.advert.service_data;
-            if payload_changed {
-                device.payload_since = now;
-            }
-            device.advert = advert;
-            device.hits = hits;
-            device.last_seen = now;
-            device.updates += 1;
-        } else {
-            let device = Device {
+            Entry::Vacant(entry) => entry.insert(Device {
                 rssi_avg: advert.rssi.map(|r| r as f32),
                 advert,
                 hits,
@@ -154,56 +157,11 @@ impl Session {
                 follow: None,
                 payload_since: now,
                 last_logged: None,
-            };
-            self.devices.insert(id.clone(), device);
-        }
-        self.log(&id, now);
-    }
-
-    /// Write the device to the log and read back what the log knows about
-    /// it: other places, and the "known" mark.
-    fn log(&mut self, id: &str, now: Instant) {
-        let Some(device) = self.devices.get_mut(id) else {
-            return;
+            }),
         };
-        if device.last_logged.is_some_and(|at| now.duration_since(at) < LOG_INTERVAL) {
-            return;
-        }
-        device.last_logged = Some(now);
-
-        let stable = now.duration_since(device.payload_since) >= PAYLOAD_STABLE_AFTER;
-        let keys = identity::keys(&device.advert, stable);
-        device.known = keys.iter().any(|key| self.known.contains(&key.text));
-
-        let Some(store) = &self.store else {
-            return;
-        };
-        let title = device.title();
-        let signature = device.hits.first().map(|&index| self.db.get(index).id.as_str());
-        let mut follow: Option<Follow> = None;
-        let mut result = Ok(());
-        for key in &keys {
-            result = result.and_then(|()| {
-                store.record(&key.text, &self.place, device.advert.rssi, title.as_deref(), signature)
-            });
-            // A device that is known through one key is known through all.
-            if device.known && self.known.insert(key.text.clone()) {
-                result = result.and_then(|()| store.set_known(&key.text, title.as_deref(), true));
-            }
-            match store.other_places(&key.text, &self.place) {
-                Ok(0) => {}
-                Ok(places) => {
-                    let found = Follow { places, basis: key.basis };
-                    let better = follow.is_none_or(|f| (found.basis, found.places) > (f.basis, f.places));
-                    if better {
-                        follow = Some(found);
-                    }
-                }
-                Err(error) => result = result.and(Err(error)),
-            }
-        }
-        device.follow = follow;
-        if let Err(error) = result {
+        let log =
+            Log { db: &self.db, store: self.store.as_ref(), place: &self.place, known: &mut self.known };
+        if let Err(error) = log.write(device, now) {
             self.store_error = Some(format!("{error:#}"));
         }
     }
@@ -278,6 +236,59 @@ impl Session {
     }
 }
 
+/// The parts of a session that a log write needs, apart from the device.
+struct Log<'a> {
+    db: &'a SignatureDb,
+    store: Option<&'a Store>,
+    place: &'a str,
+    known: &'a mut HashSet<String>,
+}
+
+impl Log<'_> {
+    /// Write the device to the log and read back what the log knows about
+    /// it: other places, and the "known" mark.
+    fn write(self, device: &mut Device, now: Instant) -> anyhow::Result<()> {
+        if device.last_logged.is_some_and(|at| now.duration_since(at) < LOG_INTERVAL) {
+            return Ok(());
+        }
+        device.last_logged = Some(now);
+
+        let stable = now.duration_since(device.payload_since) >= PAYLOAD_STABLE_AFTER;
+        let keys = identity::keys(&device.advert, stable);
+        device.known = keys.iter().any(|key| self.known.contains(&key.text));
+
+        let Some(store) = self.store else {
+            return Ok(());
+        };
+        let title = device.title();
+        let signature = device.hits.first().map(|&index| self.db.get(index).id.as_str());
+        let mut follow: Option<Follow> = None;
+        let mut result = Ok(());
+        for key in &keys {
+            result = result.and_then(|()| {
+                store.record(&key.text, self.place, device.advert.rssi, title.as_deref(), signature)
+            });
+            // A device that is known through one key is known through all.
+            if device.known && self.known.insert(key.text.clone()) {
+                result = result.and_then(|()| store.set_known(&key.text, title.as_deref(), true));
+            }
+            match store.other_places(&key.text, self.place) {
+                Ok(0) => {}
+                Ok(places) => {
+                    let found = Follow { places, basis: key.basis };
+                    let better = follow.is_none_or(|f| (found.basis, found.places) > (f.basis, f.places));
+                    if better {
+                        follow = Some(found);
+                    }
+                }
+                Err(error) => result = result.and(Err(error)),
+            }
+        }
+        device.follow = follow;
+        result
+    }
+}
+
 /// "seen at 2 other place(s), same name"
 pub fn follow_text(follow: Follow) -> String {
     format!("seen at {} other place(s), same {}", follow.places, follow.basis.label())
@@ -318,6 +329,16 @@ mod tests {
         let order: Vec<&str> = session.sorted(true).iter().map(|d| d.advert.id.as_str()).collect();
         assert_eq!(order, ["tile-far", "plain-near"]);
         assert_eq!(session.sorted(false).len(), 1);
+    }
+
+    #[test]
+    fn equal_devices_sort_by_id() {
+        let mut session = session();
+        for id in ["c", "a", "b"] {
+            session.ingest(advert(id, -60));
+        }
+        let order: Vec<&str> = session.sorted(true).iter().map(|d| d.advert.id.as_str()).collect();
+        assert_eq!(order, ["a", "b", "c"]);
     }
 
     #[test]
@@ -452,6 +473,41 @@ mod tests {
         assert_eq!(session.toggle_known("tile"), Some(true));
         assert!(!session.is_flagged(session.get("tile").unwrap()));
         assert!(session.followers().is_empty());
+    }
+
+    #[test]
+    fn log_errors_are_kept_and_the_scan_goes_on() {
+        let store = Store::in_memory().unwrap();
+        store.break_for_tests();
+        let mut session = Session::new(db(), Some(store), "office".into());
+        assert!(session.store_error.as_deref().unwrap().contains("no such table"));
+
+        session.store_error = None;
+        session.ingest(tile("tile", -50));
+        assert!(session.store_error.as_deref().unwrap().contains("no such table"));
+        assert!(session.is_flagged(session.get("tile").unwrap()));
+
+        session.store_error = None;
+        assert_eq!(session.toggle_known("tile"), Some(true));
+        assert!(session.store_error.is_some());
+        assert!(session.followers().is_empty());
+        assert_eq!(session.toggle_known("missing"), None);
+    }
+
+    #[test]
+    fn first_signal_value_starts_the_average() {
+        let mut session = Session::new(db(), None, "office".into());
+        assert!(session.is_empty());
+        session.ingest(Advert { id: "a".into(), ..Default::default() });
+        assert_eq!(session.get("a").unwrap().rssi_avg, None);
+        assert_eq!(session.get("a").unwrap().distance_m(), None);
+        session.ingest(advert("a", -60));
+        assert_eq!(session.get("a").unwrap().rssi_avg, Some(-60.0));
+        // An update without a signal value keeps the average.
+        session.ingest(Advert { id: "a".into(), ..Default::default() });
+        assert_eq!(session.get("a").unwrap().rssi_avg, Some(-60.0));
+        assert_eq!(session.len(), 1);
+        assert!(!session.is_empty());
     }
 
     #[test]

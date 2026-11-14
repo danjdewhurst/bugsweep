@@ -5,12 +5,13 @@ use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::backend::Backend;
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Gauge, Paragraph, Row, Sparkline, Table, TableState, Tabs, Wrap};
-use ratatui::{DefaultTerminal, Frame};
+use ratatui::{Frame, Terminal};
 
 use crate::ble::BleEvent;
 use crate::lan::{LanHost, LanReport, Verdict};
@@ -66,11 +67,20 @@ struct App<'a> {
 /// Run the interface until the user quits. `start_lan` starts one network
 /// sweep, whose result must arrive as `AppEvent::Lan`.
 pub fn run(session: Session, events: Receiver<AppEvent>, start_lan: &dyn Fn()) -> Result<()> {
-    let mut app = App::new(session, start_lan);
     let mut terminal = ratatui::init();
-    let result = app.event_loop(&mut terminal, events);
+    let result = App::new(session, start_lan).event_loop(&mut terminal, events, &mut read_key);
     ratatui::restore();
     result
+}
+
+/// Wait up to `wait` for one key event from the real terminal.
+fn read_key(wait: Duration) -> Result<Option<KeyEvent>> {
+    if event::poll(wait)?
+        && let Event::Key(key) = event::read()?
+    {
+        return Ok(Some(key));
+    }
+    Ok(None)
 }
 
 impl<'a> App<'a> {
@@ -92,7 +102,17 @@ impl<'a> App<'a> {
         }
     }
 
-    fn event_loop(&mut self, terminal: &mut DefaultTerminal, events: Receiver<AppEvent>) -> Result<()> {
+    /// Draw, handle events and handle keys until the user quits. `next_key`
+    /// waits up to the given time for one key event.
+    fn event_loop<B: Backend>(
+        &mut self,
+        terminal: &mut Terminal<B>,
+        events: Receiver<AppEvent>,
+        next_key: &mut dyn FnMut(Duration) -> Result<Option<KeyEvent>>,
+    ) -> Result<()>
+    where
+        B::Error: Send + Sync + 'static,
+    {
         let mut last_sample = Instant::now();
         loop {
             while let Ok(event) = events.try_recv() {
@@ -103,8 +123,7 @@ impl<'a> App<'a> {
                 self.sample_finder();
             }
             terminal.draw(|frame| self.draw(frame))?;
-            if event::poll(TICK)?
-                && let Event::Key(key) = event::read()?
+            if let Some(key) = next_key(TICK)?
                 && key.kind == KeyEventKind::Press
             {
                 let ctrl_c = key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
@@ -750,7 +769,7 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use super::*;
-    use crate::lan::{Neighbour, OpenPort};
+    use crate::lan::{Neighbour, Onvif, OpenPort};
     use crate::model::{Advert, parse_uuid};
     use crate::signatures::SignatureDb;
     use crate::store::Store;
@@ -787,30 +806,23 @@ mod tests {
         session
     }
 
+    /// `start_lan` for tests that do not count the sweeps.
+    fn noop() {}
+
     fn render(app: &mut App) -> String {
         let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
         terminal.draw(|frame| app.draw(frame)).unwrap();
-        let buffer = terminal.backend().buffer();
-        let mut text = String::new();
-        for y in 0..buffer.area.height {
-            for x in 0..buffer.area.width {
-                text.push_str(buffer[(x, y)].symbol());
-            }
-            text.push('\n');
-        }
-        text
+        screen_of(&terminal)
     }
 
     #[test]
     fn device_view_lists_findings_in_order() {
-        let noop = || {};
         let mut app = App::new(session(), &noop);
         let screen = render(&mut app);
         let row = |needle: &str| {
-            screen
-                .lines()
-                .position(|l| l.contains(needle))
-                .unwrap_or_else(|| panic!("{needle} missing:\n{screen}"))
+            let position = screen.lines().position(|l| l.contains(needle));
+            assert!(position.is_some(), "{needle} missing:\n{screen}");
+            position.unwrap()
         };
         // High first, then medium findings by signal, then devices without a finding.
         assert!(row("Meta smart glasses") < row("Tile tracker"));
@@ -829,7 +841,6 @@ mod tests {
 
     #[test]
     fn mark_as_known_removes_the_flag() {
-        let noop = || {};
         let mut app = App::new(session(), &noop);
         render(&mut app);
         assert_eq!(app.selected.as_deref(), Some("glasses"));
@@ -843,7 +854,6 @@ mod tests {
 
     #[test]
     fn selection_moves_and_finder_opens() {
-        let noop = || {};
         let mut app = App::new(session(), &noop);
         render(&mut app);
         app.on_key(KeyCode::Down);
@@ -910,7 +920,6 @@ mod tests {
 
     #[test]
     fn followers_view_reads_the_log() {
-        let noop = || {};
         let mut app = App::new(session(), &noop);
         app.on_key(KeyCode::Char('3'));
         let screen = render(&mut app);
@@ -921,10 +930,408 @@ mod tests {
         assert!(!screen.contains("Desk lamp"), "{screen}");
     }
 
+    fn press(code: KeyCode) -> Option<KeyEvent> {
+        Some(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn screen_of(terminal: &Terminal<TestBackend>) -> String {
+        let buffer = terminal.backend().buffer();
+        let mut text = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    fn text_of(lines: &[Line]) -> String {
+        lines.iter().map(|line| line.to_string()).collect::<Vec<_>>().join("\n")
+    }
+
+    /// Run the event loop with a list of key results. The list must end the loop.
+    fn run_keys(
+        app: &mut App,
+        events: Receiver<AppEvent>,
+        keys: Vec<Result<Option<KeyEvent>>>,
+    ) -> (Result<()>, String) {
+        let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        let mut keys = VecDeque::from(keys);
+        let result = app.event_loop(&mut terminal, events, &mut |wait| {
+            assert_eq!(wait, TICK);
+            keys.pop_front().expect("the loop must end before the keys do")
+        });
+        (result, screen_of(&terminal))
+    }
+
+    #[test]
+    fn event_loop_reads_events_and_keys_until_quit() {
+        let mut app = App::new(session(), &noop);
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(AppEvent::Ble(BleEvent::Started("hci0".into()))).unwrap();
+        tx.send(AppEvent::Ble(BleEvent::Advert(Advert { id: "new".into(), ..Default::default() }))).unwrap();
+        let mut release = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
+        release.kind = KeyEventKind::Release;
+        let keys = vec![Ok(None), Ok(Some(release)), Ok(press(KeyCode::Tab)), Ok(press(KeyCode::Char('q')))];
+        let (result, screen) = run_keys(&mut app, rx, keys);
+        result.unwrap();
+        // The release of q did not quit, and Tab changed the view before q quit.
+        assert!(app.view == View::Network);
+        assert!(app.session.get("new").is_some());
+        assert!(screen.contains("scanning (hci0)"), "{screen}");
+        assert!(screen.contains("Press l to start the sweep."), "{screen}");
+    }
+
+    #[test]
+    fn ctrl_c_quits_also_in_the_finder() {
+        let mut app = App::new(session(), &noop);
+        app.finder = Some("phone".into());
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        // A plain c does nothing in the finder.
+        let keys = vec![Ok(press(KeyCode::Char('c'))), Ok(Some(ctrl_c))];
+        let (result, screen) = run_keys(&mut app, rx, keys);
+        result.unwrap();
+        assert!(app.finder.is_some());
+        assert!(screen.contains("Finder"), "{screen}");
+    }
+
+    #[test]
+    fn key_errors_end_the_loop() {
+        let mut app = App::new(session(), &noop);
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let (result, _) = run_keys(&mut app, rx, vec![Err(anyhow::anyhow!("no terminal"))]);
+        assert_eq!(result.unwrap_err().to_string(), "no terminal");
+    }
+
+    #[test]
+    fn finder_samples_the_signal_each_tick() {
+        let mut app = App::new(session(), &noop);
+        app.finder = Some("phone".into());
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        let mut calls = 0;
+        app.event_loop(&mut terminal, rx, &mut |_| {
+            calls += 1;
+            if calls == 1 {
+                std::thread::sleep(TICK);
+                return Ok(None);
+            }
+            Ok(Some(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)))
+        })
+        .unwrap();
+        // -40 dBm is 92 percent.
+        assert_eq!(app.finder_history, [92]);
+    }
+
+    #[test]
+    fn bluetooth_and_sweep_events_change_the_status() {
+        let mut app = App::new(session(), &noop);
+        let header = |app: &mut App| render(app).lines().next().unwrap().to_string();
+        assert!(header(&mut app).contains("Bluetooth: starting"));
+        app.on_app_event(AppEvent::Ble(BleEvent::Power(true)));
+        assert!(app.ble_ok);
+        assert!(header(&mut app).contains("Bluetooth: scanning"));
+        app.on_app_event(AppEvent::Ble(BleEvent::Power(false)));
+        assert!(!app.ble_ok);
+        assert!(header(&mut app).contains("Bluetooth is off"));
+        app.on_app_event(AppEvent::Ble(BleEvent::Failed("no adapter".into())));
+        assert!(header(&mut app).contains("failed: no adapter"));
+
+        app.session.store_error = Some("disk full".into());
+        assert!(header(&mut app).contains("log error: disk full"));
+
+        app.on_key(KeyCode::Char('2'));
+        app.on_key(KeyCode::Char('l'));
+        assert!(matches!(app.lan, LanState::Running(_)));
+        app.on_app_event(AppEvent::Lan(Err("no private IPv4 network found".into())));
+        let screen = render(&mut app);
+        assert!(screen.contains("The sweep failed: no private IPv4 network found"), "{screen}");
+        assert!(screen.contains("Press l to try again."), "{screen}");
+    }
+
+    #[test]
+    fn views_cycle_with_tab_and_numbers() {
+        let mut app = App::new(session(), &noop);
+        let footer = |app: &mut App| render(app).lines().rev().nth(1).unwrap().to_string();
+        assert!(footer(&mut app).contains("m mark as known"));
+        app.on_key(KeyCode::Tab);
+        assert!(app.view == View::Network);
+        assert!(footer(&mut app).contains("l start the sweep"));
+        app.on_key(KeyCode::Tab);
+        assert!(app.view == View::Followers);
+        assert!(footer(&mut app).trim_end().ends_with("Tab view   q quit"));
+        app.on_key(KeyCode::Tab);
+        assert!(app.view == View::Devices);
+        app.on_key(KeyCode::Char('3'));
+        assert!(app.view == View::Followers);
+        // Device keys do nothing in the other views.
+        app.on_key(KeyCode::Down);
+        app.on_key(KeyCode::Char('m'));
+        assert_eq!(app.selected.as_deref(), Some("glasses"));
+        assert!(!app.session.get("glasses").unwrap().known);
+        app.on_key(KeyCode::Char('1'));
+        assert!(app.view == View::Devices);
+    }
+
+    #[test]
+    fn empty_lists_explain_themselves() {
+        let db = Arc::new(SignatureDb::embedded().unwrap());
+        let mut app = App::new(Session::new(db, None, "office".into()), &noop);
+        assert!(render(&mut app).contains("No devices yet."));
+        app.on_key(KeyCode::Down);
+        assert_eq!(app.selected, None);
+        // m and f without a selection do nothing.
+        app.on_key(KeyCode::Char('m'));
+        app.on_key(KeyCode::Enter);
+        assert!(app.finder.is_none());
+        app.on_key(KeyCode::Char('a'));
+        assert!(render(&mut app).contains("No flagged devices. Press a to show all devices."));
+        app.on_key(KeyCode::Char('3'));
+        assert!(render(&mut app).contains("The log is off, so there is no history."));
+
+        let db = Arc::new(SignatureDb::embedded().unwrap());
+        let store = Store::in_memory().unwrap();
+        let mut app = App::new(Session::new(db, Some(store), "office".into()), &noop);
+        app.on_key(KeyCode::Char('3'));
+        assert!(render(&mut app).contains("No device was seen at two or more places."));
+    }
+
+    #[test]
+    fn followers_without_a_name() {
+        let db = Arc::new(SignatureDb::embedded().unwrap());
+        let store = Store::in_memory().unwrap();
+        store.record("id:anon", "home", None, None, None).unwrap();
+        store.record("id:anon", "gym", None, None, None).unwrap();
+        let mut app = App::new(Session::new(db, Some(store), "office".into()), &noop);
+        app.on_key(KeyCode::Char('3'));
+        let screen = render(&mut app);
+        assert!(screen.contains("(no name)"), "{screen}");
+        assert!(screen.contains("id:anon"), "{screen}");
+    }
+
+    #[test]
+    fn selection_moves_up_and_stops_at_the_ends() {
+        let mut app = App::new(session(), &noop);
+        app.on_key(KeyCode::Char('k'));
+        assert_eq!(app.selected.as_deref(), Some("glasses"));
+        app.on_key(KeyCode::Up);
+        assert_eq!(app.selected.as_deref(), Some("glasses"));
+        for _ in 0..10 {
+            app.on_key(KeyCode::Char('j'));
+        }
+        assert_eq!(app.selected.as_deref(), Some("lamp"));
+        app.on_key(KeyCode::Up);
+        assert_eq!(app.selected.as_deref(), Some("tile"));
+    }
+
+    #[test]
+    fn known_device_and_stale_device_rows() {
+        let mut session = session();
+        let long_ago = Instant::now().checked_sub(Duration::from_secs(90)).unwrap();
+        session.ingest_at(
+            Advert { id: "old".into(), name: Some("Old speaker".into()), ..Default::default() },
+            long_ago,
+        );
+        let mut app = App::new(session, &noop);
+        app.selected = Some("lamp".into());
+        app.on_key(KeyCode::Char('m'));
+        let screen = render(&mut app);
+        let row = |needle: &str| screen.lines().find(|l| l.contains(needle)).unwrap().to_string();
+        assert!(row("Desk lamp").contains("known"), "{screen}");
+        assert!(row("Old speaker").contains("1m"), "{screen}");
+        // A device without a signal value has no signal bar and no distance.
+        assert!(!row("Old speaker").contains("dBm"), "{screen}");
+    }
+
+    #[test]
+    fn finder_states() {
+        let mut session = session();
+        let long_ago = Instant::now().checked_sub(Duration::from_secs(90)).unwrap();
+        session.ingest_at(Advert { id: "old".into(), rssi: Some(-50), ..Default::default() }, long_ago);
+        session.ingest(Advert { id: "quiet".into(), ..Default::default() });
+        session.ingest(Advert { id: "far".into(), rssi: Some(-90), ..Default::default() });
+        let mut app = App::new(session, &noop);
+
+        let finder = |app: &mut App, id: &str| {
+            app.selected = Some(id.into());
+            app.on_key(KeyCode::Enter);
+            let screen = render(app);
+            app.on_key(KeyCode::Esc);
+            assert!(app.finder.is_none());
+            screen
+        };
+        assert!(finder(&mut app, "old").contains("no signal for 1m"));
+        assert!(finder(&mut app, "quiet").contains("no signal value"));
+        assert!(finder(&mut app, "far").contains("-90 dBm"));
+        assert!(finder(&mut app, "glasses").contains("-70 dBm"));
+        let screen = finder(&mut app, "phone");
+        assert!(screen.contains("f/Esc leave the finder"), "{screen}");
+
+        app.finder = Some("gone".into());
+        app.sample_finder();
+        assert!(app.finder_history.is_empty());
+        assert!(render(&mut app).contains("The device is gone."));
+
+        app.finder = Some("phone".into());
+        for _ in 0..FINDER_SAMPLES + 5 {
+            app.sample_finder();
+        }
+        assert_eq!(app.finder_history.len(), FINDER_SAMPLES);
+        assert!(app.on_key(KeyCode::Char('f')));
+        assert!(app.finder.is_none());
+        assert!(app.finder_history.is_empty());
+    }
+
+    #[test]
+    fn details_show_all_advert_fields() {
+        let mut session = session();
+        let mut advert = Advert {
+            id: "full".into(),
+            address: Some("aa:bb:cc:dd:ee:ff".into()),
+            tx_power: Some(-8),
+            ..Default::default()
+        };
+        advert.manufacturer_data.insert(0xFFFE, vec![0xAB; 30]);
+        advert.services.push(parse_uuid("feed").unwrap());
+        advert.services.push(parse_uuid("12345678-1234-1234-1234-123456789abc").unwrap());
+        advert.service_data.insert(parse_uuid("feed").unwrap(), vec![1, 2]);
+        session.ingest(advert);
+        let app = App::new(session, &noop);
+        let device = app.session.get("full").unwrap();
+        let text = text_of(&app.detail_lines(device));
+        assert!(text.contains("Tile tracker"), "{text}");
+        assert!(text.contains("A Tile sends the same frame"), "{text}");
+        assert!(text.contains("aa:bb:cc:dd:ee:ff  (full)"), "{text}");
+        assert!(text.contains("0xfffe unknown company: "), "{text}");
+        assert!(text.contains("… (30 bytes)"), "{text}");
+        assert!(text.contains("feed (Tile, Inc.)") || text.contains("(Tile"), "{text}");
+        assert!(text.contains("12345678-1234-1234-1234-123456789abc"), "{text}");
+        assert!(text.contains("Svc data"), "{text}");
+        assert!(text.contains("TX power -8 dBm"), "{text}");
+
+        let lamp = app.session.get("lamp").unwrap();
+        let text = text_of(&app.detail_lines(lamp));
+        assert!(text.contains("No finding for this device."), "{text}");
+        assert!(text.contains("the system hides the address"), "{text}");
+    }
+
+    #[test]
+    fn details_warn_when_a_name_or_payload_match_can_be_another_device() {
+        let db = Arc::new(SignatureDb::embedded().unwrap());
+        let mut payload = Advert { id: "id-2".into(), rssi: Some(-50), ..Default::default() };
+        payload.manufacturer_data.insert(0x0075, vec![0x42, 4, 1, 0x80, 0x60, 0xCC, 0x6E]);
+        let named = Advert { id: "id-3".into(), name: Some("Key tag".into()), ..Default::default() };
+
+        let store = Store::in_memory().unwrap();
+        for key in crate::identity::keys(&payload, true).iter().chain(&crate::identity::keys(&named, false)) {
+            if key.basis != crate::identity::Basis::Id {
+                store.record(&key.text, "home", None, None, None).unwrap();
+            }
+        }
+        let mut session = Session::new(db, Some(store), "office".into());
+        let start = Instant::now();
+        session.ingest_at(payload.clone(), start);
+        session.ingest_at(payload, start + Duration::from_secs(61));
+        session.ingest(named);
+        let app = App::new(session, &noop);
+
+        let text = text_of(&app.detail_lines(app.session.get("id-2").unwrap()));
+        assert!(
+            text.contains("same data. A different device of the same model can send this data."),
+            "{text}"
+        );
+        let text = text_of(&app.detail_lines(app.session.get("id-3").unwrap()));
+        assert!(
+            text.contains("same name. A different device of the same model can have this name."),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn network_results_without_evidence_and_with_weak_evidence() {
+        let mut app = App::new(session(), &noop);
+        app.on_key(KeyCode::Char('2'));
+        app.on_app_event(AppEvent::Lan(Ok(LanReport {
+            networks: vec!["10.0.0.0/24 (en0)".into()],
+            addresses_probed: 253,
+            seconds: 4.0,
+            hosts: vec![],
+            others: vec![],
+        })));
+        let screen = render(&mut app);
+        assert!(screen.contains("No camera evidence found. 0 other host(s) answered."), "{screen}");
+
+        let other = |last: u8, vendor: Option<&str>, note: Option<&'static str>| Neighbour {
+            ip: Ipv4Addr::new(10, 0, 0, last),
+            mac: format!("00:11:22:33:44:{last:02x}"),
+            vendor: vendor.map(str::to_string),
+            note,
+        };
+        app.on_app_event(AppEvent::Lan(Ok(LanReport {
+            networks: vec!["10.0.0.0/24 (en0)".into()],
+            addresses_probed: 253,
+            seconds: 4.0,
+            hosts: vec![LanHost {
+                ip: Ipv4Addr::new(10, 0, 0, 9),
+                mac: None,
+                vendor: None,
+                camera_vendor: false,
+                verdict: Verdict::Possible,
+                open_ports: vec![OpenPort { port: 8000, meaning: "Hikvision device port" }],
+                rtsp: None,
+                onvif: None,
+            }],
+            others: vec![
+                other(2, Some("Espressif Inc."), Some("Wi-Fi chip")),
+                other(3, None, Some("private address")),
+                other(4, None, None),
+            ],
+        })));
+        app.on_key(KeyCode::Char('a'));
+        let screen = render(&mut app);
+        assert!(screen.contains("1 host(s) with camera evidence. 3 other host(s) answered."), "{screen}");
+        assert!(screen.contains("maybe"), "{screen}");
+        assert!(screen.contains("port 8000 (Hikvision device port)"), "{screen}");
+        assert!(screen.contains("Espressif Inc. (Wi-Fi chip)"), "{screen}");
+        assert!(screen.contains("private address"), "{screen}");
+        assert!(screen.contains("unknown vendor"), "{screen}");
+    }
+
+    #[test]
+    fn evidence_text_for_camera_makers_and_onvif() {
+        let host = LanHost {
+            ip: Ipv4Addr::new(10, 0, 0, 9),
+            mac: None,
+            vendor: Some("Hangzhou Hikvision".into()),
+            camera_vendor: true,
+            verdict: Verdict::Likely,
+            open_ports: vec![],
+            rtsp: Some("yes".into()),
+            onvif: Some(Onvif { name: Some("Door".into()), hardware: Some("DS-2".into()), address: None }),
+        };
+        assert_eq!(
+            lan_evidence(&host),
+            "camera maker: Hangzhou Hikvision; ONVIF camera: Door / DS-2; RTSP server"
+        );
+        let bare = LanHost { vendor: None, rtsp: None, onvif: Some(Onvif::default()), ..host };
+        assert_eq!(lan_evidence(&bare), "ONVIF camera");
+    }
+
+    #[test]
+    fn level_tags_and_styles() {
+        let levels = [Level::High, Level::Medium, Level::Low, Level::Info];
+        let tags: Vec<&str> = levels.into_iter().map(level_tag).collect();
+        assert_eq!(tags, ["HIGH", "MED", "low", "info"]);
+        assert_eq!(level_style(Some(Level::Low)), Style::new().cyan());
+        assert_eq!(level_style(Some(Level::Info)), Style::new());
+        assert_eq!(level_style(None), Style::new());
+    }
+
     #[test]
     fn print_screen() {
         // Run with `cargo test print_screen -- --nocapture` to see the layout.
-        let noop = || {};
         let mut app = App::new(session(), &noop);
         app.on_app_event(AppEvent::Ble(BleEvent::Started("CoreBluetooth".into())));
         println!("{}", render(&mut app));
