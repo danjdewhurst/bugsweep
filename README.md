@@ -104,6 +104,7 @@ this", not "this is a bug".
 
 ```sh
 bugsweep                     # terminal interface
+bugsweep gui                 # desktop window
 bugsweep scan                # scan for 15 s and print a table
 bugsweep scan --json --seconds 30
 bugsweep scan --flagged      # only devices that need attention
@@ -126,6 +127,10 @@ Keys in the terminal interface:
 | `Tab`, `1` `2` `3` | change the view |
 | `l` | start the network sweep (network view only) |
 | `q` | quit |
+
+The desktop window (`bugsweep gui`) has the same three views as the terminal
+interface. Click a device to see its details. The buttons in the details pane
+open the finder and mark a device as yours.
 
 The network sweep sends connection attempts to each address of the local
 network. Run it only on a network where you are allowed to do that.
@@ -214,9 +219,11 @@ cameras."
 ## Platform notes
 
 - **macOS**: the terminal app needs the Bluetooth permission (System Settings
-  → Privacy & Security → Bluetooth). macOS hides MAC addresses, so rules with
-  `address_prefix` do not work there.
-- **Linux**: needs BlueZ. Gives MAC addresses.
+  → Privacy & Security → Bluetooth). This also applies to `bugsweep gui`,
+  because the window gets the permission of the terminal that starts it.
+  macOS hides MAC addresses, so rules with `address_prefix` do not work there.
+- **Linux**: needs BlueZ. Gives MAC addresses. `bugsweep gui` needs a desktop
+  with X11 or Wayland and OpenGL.
 - **Windows**: should work through WinRT. Not tested yet.
 
 ## Development
@@ -248,7 +255,7 @@ release workflow builds and uploads the binaries.
 | File | Job |
 |---|---|
 | `src/cli.rs` | command line, and the `Hardware` trait that tests replace |
-| `src/hardware.rs` | the real Bluetooth adapter, network sweep and terminal (no coverage) |
+| `src/hardware.rs` | the real Bluetooth adapter, network sweep, terminal and window (no coverage) |
 | `src/ble.rs` | Bluetooth LE scan loop |
 | `src/signatures.rs` | signature database and matcher |
 | `src/session.rs` | live device list, levels, link to the log |
@@ -257,6 +264,7 @@ release workflow builds and uploads the binaries.
 | `src/place.rs` | place key from the default gateway |
 | `src/lan.rs` | network camera sweep |
 | `src/tui.rs` | terminal interface (ratatui) |
+| `src/gui.rs` | desktop window (egui) |
 | `src/vendors.rs` | company, service-UUID and MAC-prefix owner names |
 
 ## Credits

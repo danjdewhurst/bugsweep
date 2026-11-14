@@ -2,6 +2,7 @@
 
 pub mod ble;
 pub mod cli;
+pub mod gui;
 pub mod hardware;
 pub mod identity;
 pub mod lan;
