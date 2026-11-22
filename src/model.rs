@@ -21,6 +21,20 @@ pub struct Advert {
     pub services: Vec<Uuid>,
 }
 
+impl Advert {
+    /// The advert carries nothing: no signal value, no name, no transmit
+    /// power, no manufacturer data, no services and no service data. Such
+    /// an entry is noise, for example a device that the system cached.
+    pub fn is_empty(&self) -> bool {
+        self.rssi.is_none()
+            && self.name.as_deref().is_none_or(|name| name.trim().is_empty())
+            && self.tx_power.is_none()
+            && self.manufacturer_data.is_empty()
+            && self.services.is_empty()
+            && self.service_data.is_empty()
+    }
+}
+
 const BASE_UUID_TAIL: u128 = 0x0000_1000_8000_0080_5f9b_34fb;
 
 /// Expand a 16-bit or 32-bit short UUID, or parse a full UUID.
@@ -60,6 +74,23 @@ mod tests {
         assert_eq!(uuid.to_string(), "0000fd5a-0000-1000-8000-00805f9b34fb");
         assert_eq!(short_uuid(&uuid), Some(0xfd5a));
         assert_eq!(uuid_label(&uuid), "fd5a");
+    }
+
+    #[test]
+    fn empty_adverts() {
+        let empty = Advert { id: "a".into(), address: Some("aa:bb:cc:dd:ee:ff".into()), ..Advert::default() };
+        assert!(empty.is_empty());
+        assert!(Advert { name: Some(" ".into()), ..empty.clone() }.is_empty());
+        let uuid = parse_uuid("fd44").unwrap();
+        let with_data = [
+            Advert { rssi: Some(-90), ..empty.clone() },
+            Advert { name: Some("Tag".into()), ..empty.clone() },
+            Advert { tx_power: Some(4), ..empty.clone() },
+            Advert { manufacturer_data: BTreeMap::from([(0x004c, vec![])]), ..empty.clone() },
+            Advert { services: vec![uuid], ..empty.clone() },
+            Advert { service_data: BTreeMap::from([(uuid, vec![])]), ..empty.clone() },
+        ];
+        assert!(with_data.iter().all(|advert| !advert.is_empty()));
     }
 
     #[test]

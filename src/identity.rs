@@ -46,6 +46,21 @@ impl Basis {
     }
 }
 
+/// The prefixes of the stored keys.
+const PREFIXES: &[&str] = &["id", "findmy", "fmdn", "smarttag", "name", "data", "svc"];
+
+/// The stored key for a device ID that a person or a script gives: a key as
+/// `followers` prints it ("id:…", "name:…", "findmy:…"), or a bare platform
+/// ID as in the `id` field of `scan --json`. `None` when the ID is empty.
+pub fn key_from_user(text: &str) -> Option<String> {
+    let text = text.trim();
+    let bare = match text.split_once(':') {
+        Some((prefix, rest)) if PREFIXES.contains(&prefix) => rest,
+        _ => return (!text.is_empty()).then(|| format!("id:{text}")),
+    };
+    (!bare.trim().is_empty()).then(|| text.to_string())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Key {
     pub basis: Basis,
@@ -118,6 +133,18 @@ pub fn keys(advert: &Advert, payload_stable: bool) -> Vec<Key> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keys_from_people_and_scripts() {
+        assert_eq!(key_from_user(" 5F3A-UUID ").as_deref(), Some("id:5F3A-UUID"));
+        // A Linux ID is a MAC address, and its first octet is not a prefix.
+        assert_eq!(key_from_user("AA:BB:CC:DD:EE:FF").as_deref(), Some("id:AA:BB:CC:DD:EE:FF"));
+        assert_eq!(key_from_user("id:abc").as_deref(), Some("id:abc"));
+        assert_eq!(key_from_user("findmy:00ff").as_deref(), Some("findmy:00ff"));
+        assert_eq!(key_from_user("name:My watch").as_deref(), Some("name:My watch"));
+        assert_eq!(key_from_user(""), None);
+        assert_eq!(key_from_user("name: "), None);
+    }
 
     fn texts(advert: &Advert, stable: bool) -> Vec<String> {
         keys(advert, stable).into_iter().map(|k| k.text).collect()

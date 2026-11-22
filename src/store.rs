@@ -36,6 +36,15 @@ pub struct Follower {
     pub last_seen: i64,
 }
 
+/// A key that the user marked as known.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Known {
+    pub key: String,
+    pub title: Option<String>,
+    /// When the mark was set, in seconds since 1970.
+    pub added: i64,
+}
+
 fn now() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
@@ -171,6 +180,25 @@ impl Store {
         let mut stmt = self.conn.prepare("SELECT key FROM known")?;
         let keys = stmt.query_map([], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?;
         Ok(keys)
+    }
+
+    /// All keys that are marked as known, oldest mark first.
+    pub fn known(&self) -> Result<Vec<Known>> {
+        let mut stmt = self.conn.prepare("SELECT key, title, added FROM known ORDER BY added, key")?;
+        let rows =
+            stmt.query_map([], |row| Ok(Known { key: row.get(0)?, title: row.get(1)?, added: row.get(2)? }))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Whether the log has a sighting of the key, and a title that the log
+    /// has for it.
+    pub fn seen(&self, key: &str) -> Result<(bool, Option<String>)> {
+        let (count, title): (i64, Option<String>) = self.conn.query_row(
+            "SELECT COUNT(*), MAX(title) FROM sightings WHERE key = ?1",
+            params![key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok((count > 0, title))
     }
 
     /// Keys that are not marked as known and were seen at two or more places.
@@ -375,6 +403,8 @@ mod tests {
         assert!(store.set_known("id:tag", None, true).is_err());
         assert!(store.set_known("id:tag", None, false).is_err());
         assert!(store.known_keys().is_err());
+        assert!(store.known().is_err());
+        assert!(store.seen("id:tag").is_err());
         assert!(store.followers().is_err());
         assert!(store.prune().is_err());
     }

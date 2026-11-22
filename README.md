@@ -89,11 +89,19 @@ Check one with `gh attestation verify <archive> --repo danjdewhurst/bugsweep`.
 - a GSM/LTE bug,
 - a device whose Bluetooth is off,
 - smart glasses that are already connected to their phone. Meta glasses
-  advertise only at power-on, pairing or reconnect.
+  advertise only at power-on, pairing or reconnect,
+- the difference between a cloud camera and a smart-home hub. A camera that
+  only uploads to the cloud opens no ports, and on the network it looks the
+  same as a heating bridge or a charger hub. Only the volume of its upload
+  traffic can separate them, and bugsweep does not measure traffic.
 
 Many signatures are heuristics. The details pane shows the confidence, the
 kind of evidence and the source of each finding. A finding means "look at
 this", not "this is a bug".
+
+Do not run heavy port scans (for example a scan of all 65,535 ports) against
+the devices of other people. Small IoT devices can stop for many minutes
+after such a scan. `bugsweep lan` tries only a few camera ports on each host.
 
 > [!IMPORTANT]
 > If you think that someone tracks you, your safety comes first. Contact local
@@ -111,10 +119,17 @@ bugsweep scan --flagged      # only devices that need attention
 bugsweep lan                 # network camera sweep
 bugsweep lan --all           # also list hosts without camera evidence
 bugsweep followers           # devices seen at two or more places
+bugsweep known list          # devices that you marked as yours
+bugsweep known add ID...     # mark devices as yours (the `id` of scan --json, or a key from followers)
+bugsweep known remove ID...  # remove the mark
 bugsweep signatures          # list the signature database
 ```
 
 Global options: `--place NAME`, `--signatures FILE`, `--db FILE`, `--no-log`.
+
+The device lists leave out an entry that has no data at all: no signal
+value, name, transmit power, company ID, service or service data. Such an
+entry is noise, for example a device that the system remembers from before.
 
 Keys in the terminal interface:
 
@@ -122,7 +137,7 @@ Keys in the terminal interface:
 |---|---|
 | `↑` `↓` / `j` `k` | select a device |
 | `f` or `Enter` | finder for the selected device |
-| `m` | mark the device as known (yours), or remove the mark |
+| `m` | mark the device as known (yours), or remove the mark (scripts: `bugsweep known`) |
 | `a` | show all devices, or only flagged devices (Bluetooth view); show all hosts (network view) |
 | `Tab`, `1` `2` `3` | change the view |
 | `l` | start the network sweep (network view only) |
@@ -141,6 +156,20 @@ maker. The last test also finds cloud cameras, which have no open ports. It
 cannot find a camera that uses a general-purpose Wi-Fi chip and opens no
 ports; `lan --all` lists every host with its vendor so you can check by hand.
 
+Some hosts get a note that asks for a manual check: a host with a Wi-Fi chip
+that many low-cost cameras use (for example Espressif), and a Raspberry Pi
+(a small Linux computer that can run a camera). Without `--all`, `lan` gives
+the number of these hosts and their vendors. In `--json`, these hosts have
+`"needs_check": true`.
+
+The sweep also asks each host for its name and its services. It sends a
+reverse DNS query to the default gateway, and unicast mDNS queries to the
+host on UDP port 5353. The results are in `name` (for example
+`heat-hub-1234.local`) and `services` (DNS-SD service types, for example
+`_hap._tcp` or `_meshcop._udp`). The device chooses this text, so a camera
+can give a false name. A name or a service never changes a verdict or a
+note. Use it only to find the device for a physical check.
+
 ## Places and the follower check
 
 A laptop has no GPS. By default the place is a key made from the MAC address
@@ -150,7 +179,14 @@ of the default gateway, so each network is one place. Give a name with
 The log is a SQLite file in the user data directory
 (`~/Library/Application Support/bugsweep/bugsweep.db` on macOS). It never
 leaves the machine. Sightings older than 90 days are deleted. Mark your own
-devices with `m`, or they show as followers.
+devices with `m` (or `bugsweep known add`), or they show as followers.
+
+`bugsweep known add` takes the `id` from `scan --json` or a key that
+`followers` prints (`id:…`, `name:…`, `findmy:…` and so on). A device can
+have more than one key. When bugsweep next sees a device with a known key, it
+marks all keys of that device. To remove the mark from a device, remove each
+of its keys that `known list` shows. If you do not, bugsweep marks the device
+again the next time that it sees it.
 
 Most devices change their Bluetooth address every few minutes, and the
 platform ID changes with it. bugsweep therefore keeps more than one identity
@@ -263,6 +299,7 @@ release workflow builds and uploads the binaries.
 | `src/store.rs` | SQLite log, known devices, followers |
 | `src/place.rs` | place key from the default gateway |
 | `src/lan.rs` | network camera sweep |
+| `src/dns.rs` | DNS and mDNS queries for host names and services |
 | `src/tui.rs` | terminal interface (ratatui) |
 | `src/gui.rs` | desktop window (egui) |
 | `src/vendors.rs` | company, service-UUID and MAC-prefix owner names |

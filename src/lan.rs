@@ -7,10 +7,16 @@
 //! 4. A MAC address prefix that belongs to a camera maker. This also finds
 //!    cloud cameras, which have no open ports.
 //!
+//! The sweep also asks for the name of each host that answered: a reverse
+//! DNS query to the default gateway, and unicast mDNS queries to the host
+//! itself for its name and its DNS-SD service types. A name or a service is
+//! a hint for a manual check only. It never changes a verdict or a note,
+//! because the device chooses it.
+//!
 //! The sweep sends connection attempts to each address of the local network.
 //! Run it only on a network where you are allowed to do that.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -25,7 +31,8 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
-use crate::place::{normalise_mac, output_any_status};
+use crate::dns;
+use crate::place::{self, normalise_mac, output_any_status};
 use crate::vendors;
 
 /// First pass over all addresses. Short, because most addresses are empty.
@@ -37,6 +44,13 @@ const RTSP_TIMEOUT: Duration = Duration::from_millis(900);
 const ONVIF_WAIT: Duration = Duration::from_millis(2500);
 const ONVIF_TARGET: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(239, 255, 255, 250), 3702));
 const PARALLEL_CONNECTS: usize = 128;
+/// How long a name query waits for its answer. The query goes out again
+/// after half of this time.
+const NAME_WAIT: Duration = Duration::from_millis(1200);
+/// Name queries at the same time. Each query uses one socket.
+const PARALLEL_LOOKUPS: usize = 64;
+const DNS_PORT: u16 = 53;
+const MDNS_PORT: u16 = 5353;
 
 /// (port, meaning, strong evidence of a camera).
 const PORTS: &[(u16, &str, bool)] = &[
@@ -58,6 +72,9 @@ enum VendorClass {
     /// A Wi-Fi chip or module maker. Many low-cost cameras use these parts,
     /// and so do many other products.
     Module,
+    /// A maker of small Linux computers. A camera module turns one into a
+    /// camera.
+    Computer,
 }
 
 /// Start of the vendor name in the IEEE registry, in lower case. A prefix
@@ -117,6 +134,9 @@ const VENDOR_CLASSES: &[(&str, VendorClass)] = &[
     ("taixin semiconductor", VendorClass::Module),
     ("tuya smart", VendorClass::Module),
     ("espressif", VendorClass::Module),
+    // "Raspberry Pi Foundation", "Raspberry Pi Trading Ltd" and
+    // "Raspberry Pi (Trading) Ltd".
+    ("raspberry pi", VendorClass::Computer),
 ];
 
 fn vendor_class(vendor: &str) -> Option<VendorClass> {
@@ -159,6 +179,11 @@ pub struct LanHost {
     /// `Server` header of the RTSP answer, or "yes" when there is no header.
     pub rtsp: Option<String>,
     pub onvif: Option<Onvif>,
+    /// Host name from mDNS or from the DNS of the gateway. Untrusted.
+    pub name: Option<String>,
+    /// DNS-SD service types that the host advertises, for example
+    /// "_hap._tcp". Untrusted.
+    pub services: Vec<String>,
 }
 
 /// A host on the network without camera evidence.
@@ -168,6 +193,13 @@ pub struct Neighbour {
     pub mac: String,
     pub vendor: Option<String>,
     pub note: Option<&'static str>,
+    /// The vendor makes parts that cameras use, so the host needs a manual
+    /// check.
+    pub needs_check: bool,
+    /// As in [`LanHost::name`]. Untrusted.
+    pub name: Option<String>,
+    /// As in [`LanHost::services`]. Untrusted.
+    pub services: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -374,6 +406,30 @@ fn parse_arp(text: &str) -> BTreeMap<Ipv4Addr, String> {
     table
 }
 
+/// Send `query` to `server` and return the first answer from `server` with
+/// the ID of the query. The query goes out again after half of `wait`.
+async fn dns_exchange(server: SocketAddrV4, query: &[u8], wait: Duration) -> Option<Vec<u8>> {
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await.ok()?;
+    let mut buffer = vec![0u8; 9000];
+    for until in [Instant::now() + wait / 2, Instant::now() + wait] {
+        socket.send_to(query, server).await.ok()?;
+        loop {
+            let left = until.saturating_duration_since(Instant::now());
+            match timeout(left, socket.recv_from(&mut buffer)).await {
+                Ok(Ok((read, from)))
+                    if from == SocketAddr::V4(server) && buffer[..read].starts_with(&query[..2]) =>
+                {
+                    return Some(buffer[..read].to_vec());
+                }
+                // An answer from another host, or to another query.
+                Ok(Ok(_)) => {}
+                _ => break,
+            }
+        }
+    }
+    None
+}
+
 /// What the sweep needs from the system. Tests use a fake.
 pub(crate) trait Probe {
     /// The local networks to sweep.
@@ -386,6 +442,10 @@ pub(crate) trait Probe {
     async fn onvif(&self, local: Ipv4Addr) -> BTreeMap<Ipv4Addr, Onvif>;
     /// The RTSP answer of a host, as in [`rtsp_probe`].
     async fn rtsp(&self, ip: Ipv4Addr, port: u16) -> Option<String>;
+    /// The IPv4 address of the default gateway.
+    fn gateway(&self) -> Option<Ipv4Addr>;
+    /// The answer to a DNS query, as in [`dns_exchange`].
+    async fn dns(&self, server: SocketAddrV4, query: Vec<u8>, wait: Duration) -> Option<Vec<u8>>;
 }
 
 /// The real network of this machine.
@@ -421,6 +481,48 @@ impl Probe for System {
     async fn rtsp(&self, ip: Ipv4Addr, port: u16) -> Option<String> {
         rtsp_probe(ip, port).await
     }
+
+    fn gateway(&self) -> Option<Ipv4Addr> {
+        place::gateway()
+    }
+
+    async fn dns(&self, server: SocketAddrV4, query: Vec<u8>, wait: Duration) -> Option<Vec<u8>> {
+        dns_exchange(server, &query, wait).await
+    }
+}
+
+/// What a host says about itself.
+#[derive(Debug, Default)]
+struct Names {
+    name: Option<String>,
+    services: Vec<String>,
+}
+
+/// Send one PTR query for `name` to `server`, and return the targets.
+async fn ask(probe: &impl Probe, limit: &Semaphore, server: SocketAddrV4, name: &str) -> Vec<String> {
+    let _permit = limit.acquire().await;
+    let id = uuid::Uuid::new_v4().as_u128() as u16;
+    let recursion = server.port() == DNS_PORT;
+    match probe.dns(server, dns::query(id, name, recursion), NAME_WAIT).await {
+        Some(answer) => dns::ptr_targets(&answer, id, name),
+        None => Vec::new(),
+    }
+}
+
+/// The name and the service types of one host. The name the host gives
+/// over mDNS comes first; the name from the gateway's DNS is the fallback.
+async fn names_of(probe: &impl Probe, limit: &Semaphore, ip: Ipv4Addr, gateway: Option<Ipv4Addr>) -> Names {
+    let reverse = dns::reverse_name(ip);
+    let host = SocketAddrV4::new(ip, MDNS_PORT);
+    let from_gateway = async {
+        match gateway {
+            Some(gateway) => ask(probe, limit, SocketAddrV4::new(gateway, DNS_PORT), &reverse).await,
+            None => Vec::new(),
+        }
+    };
+    let (own, router, services) =
+        tokio::join!(ask(probe, limit, host, &reverse), from_gateway, ask(probe, limit, host, dns::SERVICES));
+    Names { name: dns::host_name(own.iter().chain(&router)), services: dns::service_types(&services) }
 }
 
 /// Run the full sweep with `probe`.
@@ -460,8 +562,8 @@ pub(crate) async fn sweep_with(probe: &impl Probe) -> Result<LanReport> {
     };
     // ONVIF discovery runs at the same time as the port sweep.
     let discovery = join_all(networks.iter().map(|n| probe.onvif(n.local)));
-    let (mut open, found) = tokio::join!(port_sweep, discovery);
-    let mut onvif: BTreeMap<Ipv4Addr, Onvif> = found.into_iter().flatten().collect();
+    let (open, found) = tokio::join!(port_sweep, discovery);
+    let onvif: BTreeMap<Ipv4Addr, Onvif> = found.into_iter().flatten().collect();
 
     let arp: BTreeMap<Ipv4Addr, String> =
         probe.arp_table().into_iter().filter(|(ip, _)| in_networks(ip)).collect();
@@ -473,6 +575,50 @@ pub(crate) async fn sweep_with(probe: &impl Probe) -> Result<LanReport> {
     ips.sort();
     ips.dedup();
 
+    // The name queries run at the same time as the RTSP probes. They go only
+    // to addresses in the swept networks.
+    let everyone: BTreeSet<Ipv4Addr> = ips.iter().chain(arp.keys()).copied().filter(in_networks).collect();
+    let gateway = probe.gateway().filter(in_networks);
+    let limit = Semaphore::new(PARALLEL_LOOKUPS);
+    let lookups = join_all(everyone.iter().map(|ip| names_of(probe, &limit, *ip, gateway)));
+    let (mut hosts, names) = tokio::join!(hosts_with_evidence(probe, ips, open, onvif, &arp), lookups);
+    let mut names: BTreeMap<Ipv4Addr, Names> = everyone.into_iter().zip(names).collect();
+    // A name never changes the verdict or the note: it only adds a hint.
+    for host in &mut hosts {
+        let found = names.remove(&host.ip).unwrap_or_default();
+        (host.name, host.services) = (found.name, found.services);
+    }
+    hosts.sort_by(|a, b| b.verdict.cmp(&a.verdict).then(a.ip.cmp(&b.ip)));
+
+    let others = arp
+        .iter()
+        .filter(|(ip, _)| !hosts.iter().any(|host| host.ip == **ip))
+        .map(|(ip, mac)| {
+            let found = names.remove(ip).unwrap_or_default();
+            Neighbour { name: found.name, services: found.services, ..neighbour(*ip, mac) }
+        })
+        .collect();
+
+    Ok(LanReport {
+        networks: networks.iter().map(Network::label).collect(),
+        addresses_probed,
+        seconds: started.elapsed().as_secs_f32(),
+        hosts,
+        others,
+    })
+}
+
+/// Build the hosts with camera evidence, with an RTSP probe of each open
+/// RTSP port.
+async fn hosts_with_evidence(
+    probe: &impl Probe,
+    ips: Vec<Ipv4Addr>,
+    mut open: BTreeMap<Ipv4Addr, Vec<u16>>,
+    mut onvif: BTreeMap<Ipv4Addr, Onvif>,
+    arp: &BTreeMap<Ipv4Addr, String>,
+) -> Vec<LanHost> {
+    let class_of =
+        |ip: &Ipv4Addr| arp.get(ip).and_then(|mac| vendors::mac_vendor(mac)).and_then(vendor_class);
     let mut hosts = Vec::new();
     for ip in ips {
         let mut ports = open.remove(&ip).unwrap_or_default();
@@ -505,33 +651,40 @@ pub(crate) async fn sweep_with(probe: &impl Probe) -> Result<LanReport> {
             .collect();
         let mac = arp.get(&ip).cloned();
         let vendor = mac.as_deref().and_then(vendors::mac_vendor).map(str::to_string);
-        hosts.push(LanHost { ip, mac, vendor, camera_vendor, verdict, open_ports, rtsp, onvif });
+        hosts.push(LanHost {
+            ip,
+            mac,
+            vendor,
+            camera_vendor,
+            verdict,
+            open_ports,
+            rtsp,
+            onvif,
+            name: None,
+            services: Vec::new(),
+        });
     }
-    hosts.sort_by(|a, b| b.verdict.cmp(&a.verdict).then(a.ip.cmp(&b.ip)));
-
-    let others = arp
-        .iter()
-        .filter(|(ip, _)| !hosts.iter().any(|host| host.ip == **ip))
-        .map(|(ip, mac)| neighbour(*ip, mac))
-        .collect();
-
-    Ok(LanReport {
-        networks: networks.iter().map(Network::label).collect(),
-        addresses_probed,
-        seconds: started.elapsed().as_secs_f32(),
-        hosts,
-        others,
-    })
+    hosts
 }
 
 fn neighbour(ip: Ipv4Addr, mac: &str) -> Neighbour {
     let vendor = vendors::mac_vendor(mac);
-    let note = match vendor.and_then(vendor_class) {
+    let class = vendor.and_then(vendor_class);
+    let note = match class {
         Some(VendorClass::Module) => Some("Wi-Fi chip that many low-cost cameras use"),
+        Some(VendorClass::Computer) => Some("small Linux computer that can run a camera"),
         _ if vendor.is_none() && vendors::mac_is_private(mac) => Some("private address (phone or laptop)"),
         _ => None,
     };
-    Neighbour { ip, mac: mac.to_string(), vendor: vendor.map(str::to_string), note }
+    Neighbour {
+        ip,
+        mac: mac.to_string(),
+        vendor: vendor.map(str::to_string),
+        note,
+        needs_check: matches!(class, Some(VendorClass::Module | VendorClass::Computer)),
+        name: None,
+        services: Vec::new(),
+    }
 }
 
 #[cfg(test)]
@@ -549,6 +702,11 @@ mod tests {
         assert_eq!(vendor_class("Hangzhou Hikvision Digital Technology Co.,Ltd."), Some(VendorClass::Camera));
         assert_eq!(vendor_class("Wyze Labs Inc"), Some(VendorClass::Mixed));
         assert_eq!(vendor_class("Espressif Inc."), Some(VendorClass::Module));
+        for name in ["Raspberry Pi Foundation", "Raspberry Pi Trading Ltd", "Raspberry Pi (Trading) Ltd"] {
+            let full = format!("\t{}", name.to_ascii_lowercase());
+            assert!(table.lines().any(|line| line.ends_with(&full)), "{name} is not in data/oui.tsv");
+            assert_eq!(vendor_class(name), Some(VendorClass::Computer), "{name}");
+        }
         // Names that only contain a camera name are not cameras.
         assert_eq!(vendor_class("Engineering Ring LLC Partners"), None);
         assert_eq!(vendor_class("Apple, Inc."), None);
@@ -565,7 +723,13 @@ mod tests {
         let chip = neighbour(ip, &chip_mac);
         assert_eq!(chip.vendor.as_deref(), Some("Espressif Inc."));
         assert!(chip.note.unwrap().contains("low-cost cameras"));
-        assert!(neighbour(ip, "da:a1:19:00:00:01").note.unwrap().contains("private address"));
+        assert!(chip.needs_check);
+        let computer = neighbour(ip, &mac_of("\tRaspberry Pi Foundation", 1));
+        assert_eq!(computer.note, Some("small Linux computer that can run a camera"));
+        assert!(computer.needs_check);
+        let phone = neighbour(ip, "da:a1:19:00:00:01");
+        assert!(phone.note.unwrap().contains("private address"));
+        assert!(!phone.needs_check);
         assert_eq!(neighbour(ip, "00:25:df:00:00:01").note, None);
     }
 
@@ -716,6 +880,7 @@ mod tests {
         let networks = MACHINE.networks().unwrap();
         assert!(networks.iter().all(|n| n.prefix >= 24));
         assert!(MACHINE.arp_table().values().all(|mac| mac.len() == 17));
+        assert_eq!(MACHINE.gateway(), place::gateway());
     }
 
     /// A fake ONVIF camera on the loopback address. It answers the first
@@ -796,6 +961,11 @@ mod tests {
         slow: Vec<(Ipv4Addr, u16)>,
         onvif: BTreeMap<Ipv4Addr, Onvif>,
         rtsp: BTreeMap<(Ipv4Addr, u16), String>,
+        gateway: Option<Ipv4Addr>,
+        /// PTR targets by server and asked name. A missing entry gives no answer.
+        dns: BTreeMap<(SocketAddrV4, String), Vec<&'static str>>,
+        /// The servers that got a name query.
+        asked: std::sync::Mutex<Vec<SocketAddrV4>>,
     }
 
     impl Probe for FakeProbe {
@@ -818,6 +988,20 @@ mod tests {
 
         async fn rtsp(&self, ip: Ipv4Addr, port: u16) -> Option<String> {
             self.rtsp.get(&(ip, port)).cloned()
+        }
+
+        fn gateway(&self) -> Option<Ipv4Addr> {
+            self.gateway
+        }
+
+        async fn dns(&self, server: SocketAddrV4, query: Vec<u8>, wait: Duration) -> Option<Vec<u8>> {
+            assert_eq!(wait, NAME_WAIT);
+            self.asked.lock().unwrap().push(server);
+            let (_, name) = dns::tests::asked(&query);
+            // Only a DNS server gets a query with the recursion bit.
+            assert_eq!(query[2] == 1, server.port() == DNS_PORT);
+            let targets = self.dns.get(&(server, name.clone()))?;
+            Some(dns::tests::answer(&query, 0x8400, &name, targets))
         }
     }
 
@@ -854,6 +1038,7 @@ mod tests {
             slow: vec![(ip(6), 1935), (ip(6), 8000)],
             onvif: BTreeMap::from([(ip(10), Onvif { name: Some("Door".into()), ..Onvif::default() })]),
             rtsp: BTreeMap::from([((ip(7), 554), "yes".to_string()), ((ip(8), 8554), "Cam/1".to_string())]),
+            ..FakeProbe::default()
         };
         let report = sweep_with(&probe).await.unwrap();
         assert_eq!(report.networks, ["192.168.1.0/24 (en0)", "10.0.0.0/24 (en1)"]);
@@ -889,6 +1074,141 @@ mod tests {
         assert!(others[0].1.unwrap().contains("low-cost cameras"));
         assert_eq!(others[1].0, 5);
         assert!(others[1].1.unwrap().contains("private address"));
+    }
+
+    #[tokio::test]
+    async fn sweep_adds_names_and_services() {
+        let ip = |last| Ipv4Addr::new(192, 168, 1, last);
+        let mdns = |last| SocketAddrV4::new(ip(last), MDNS_PORT);
+        let router = SocketAddrV4::new(ip(1), DNS_PORT);
+        let reverse = |last| dns::reverse_name(ip(last));
+        let services = dns::SERVICES.to_string();
+        let probe = FakeProbe {
+            networks: Some(vec![home_network()]),
+            arp: BTreeMap::from([
+                (ip(1), "00:11:22:00:00:01".into()),
+                (ip(4), mac_of("\tEspressif Inc.", 4)),
+                (ip(5), mac_of("\tRaspberry Pi Trading Ltd", 5)),
+            ]),
+            onvif: BTreeMap::from([(ip(10), Onvif::default())]),
+            gateway: Some(ip(1)),
+            dns: BTreeMap::from([
+                // The host's own name comes first; the gateway's is the fallback.
+                ((mdns(4), reverse(4)), vec!["heat-hub-1234.local"]),
+                ((router, reverse(4)), vec!["heat-hub.lan"]),
+                ((mdns(4), services.clone()), vec!["_meshcop._udp.local", "_hap._tcp.local"]),
+                ((router, reverse(5)), vec!["charger\u{1b}[2J.lan"]),
+                // A camera that calls itself harmless stays a camera.
+                ((mdns(10), reverse(10)), vec!["harmless-printer.local"]),
+                ((mdns(10), services), vec!["_ipp._tcp.local"]),
+            ]),
+            ..FakeProbe::default()
+        };
+        let report = sweep_with(&probe).await.unwrap();
+        let camera = &report.hosts[0];
+        assert_eq!(camera.verdict, Verdict::Likely);
+        assert_eq!(camera.name.as_deref(), Some("harmless-printer.local"));
+        assert_eq!(camera.services, ["_ipp._tcp"]);
+
+        let by_ip = |last| report.others.iter().find(|o| o.ip == ip(last)).unwrap();
+        let chip = by_ip(4);
+        assert_eq!(chip.name.as_deref(), Some("heat-hub-1234.local"));
+        assert_eq!(chip.services, ["_hap._tcp", "_meshcop._udp"]);
+        // A name never removes the note.
+        assert!(chip.needs_check && chip.note.unwrap().contains("low-cost cameras"));
+        let computer = by_ip(5);
+        assert_eq!(computer.name.as_deref(), Some("charger[2J.lan"));
+        assert!(computer.services.is_empty());
+        assert!(computer.needs_check && computer.note.unwrap().contains("Linux computer"));
+        let gateway = by_ip(1);
+        assert_eq!((gateway.name.as_ref(), gateway.needs_check), (None, false));
+
+        // Three queries for each host: two over mDNS, one to the gateway.
+        let asked = probe.asked.lock().unwrap();
+        assert_eq!(asked.len(), 4 * 3);
+        assert_eq!(asked.iter().filter(|server| **server == router).count(), 4);
+    }
+
+    #[tokio::test]
+    async fn gateway_outside_the_networks_gets_no_query() {
+        let ip = Ipv4Addr::new(192, 168, 1, 4);
+        let probe = FakeProbe {
+            networks: Some(vec![home_network()]),
+            arp: BTreeMap::from([(ip, "00:11:22:00:00:04".into())]),
+            gateway: Some(Ipv4Addr::new(10, 9, 9, 1)),
+            ..FakeProbe::default()
+        };
+        let report = sweep_with(&probe).await.unwrap();
+        assert_eq!(report.others[0].name, None);
+        assert_eq!(*probe.asked.lock().unwrap(), [SocketAddrV4::new(ip, MDNS_PORT); 2]);
+    }
+
+    #[tokio::test]
+    async fn host_outside_the_networks_gets_no_name_query() {
+        // An ONVIF answer can come from an address outside the swept networks.
+        let outside = Ipv4Addr::new(172, 16, 0, 9);
+        let probe = FakeProbe {
+            networks: Some(vec![home_network()]),
+            onvif: BTreeMap::from([(outside, Onvif::default())]),
+            ..FakeProbe::default()
+        };
+        let report = sweep_with(&probe).await.unwrap();
+        assert_eq!(report.hosts[0].ip, outside);
+        assert!(probe.asked.lock().unwrap().is_empty());
+    }
+
+    /// A DNS server on the loopback address. It reads queries, then sends
+    /// for each one the answers that `reply` gives, from the server socket
+    /// (`true`) or from another socket (`false`).
+    /// Packets to send, each with `true` when the server socket sends it.
+    type Replies = Vec<(bool, Vec<u8>)>;
+
+    async fn fake_dns(reply: fn(usize, &[u8]) -> Replies) -> SocketAddrV4 {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let other = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, socket.local_addr().unwrap().port());
+        tokio::spawn(async move {
+            let mut buffer = [0u8; 512];
+            for count in 0..2 {
+                let (read, from) = socket.recv_from(&mut buffer).await.unwrap();
+                for (own, packet) in reply(count, &buffer[..read]) {
+                    let sender = if own { &socket } else { &other };
+                    sender.send_to(&packet, from).await.unwrap();
+                }
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn dns_exchange_against_a_local_server() {
+        let wait = Duration::from_millis(400);
+        let query = dns::query(0x1234, "4.1.168.192.in-addr.arpa", false);
+
+        // A direct answer.
+        let server = fake_dns(|_, q| vec![(true, dns::tests::answer(q, 0x8400, "x", &[]))]).await;
+        let answer = MACHINE.dns(server, query.clone(), wait).await.unwrap();
+        assert_eq!(answer[..2], [0x12, 0x34]);
+
+        // An answer from another socket and one to another query come first.
+        let server = fake_dns(|_, q| {
+            let mut wrong_id = q.to_vec();
+            wrong_id[0] ^= 0xff;
+            vec![(false, q.to_vec()), (true, wrong_id), (true, q.to_vec())]
+        })
+        .await;
+        assert_eq!(dns_exchange(server, &query, wait).await.as_deref(), Some(&query[..]));
+
+        // The first query is lost, and the second one gets the answer.
+        let server =
+            fake_dns(|count, q| if count == 0 { Vec::new() } else { vec![(true, q.to_vec())] }).await;
+        assert!(dns_exchange(server, &query, wait).await.is_some());
+
+        // No answer at all.
+        let server = fake_dns(|_, _| Vec::new()).await;
+        let started = Instant::now();
+        assert_eq!(dns_exchange(server, &query, wait).await, None);
+        assert!(started.elapsed() >= wait);
     }
 
     #[tokio::test]

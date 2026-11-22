@@ -119,8 +119,12 @@ impl Session {
         self.ingest_at(advert, Instant::now());
     }
 
-    /// Take in the advertisement data of one device, received at `now`.
+    /// Take in the advertisement data of one device, received at `now`. A
+    /// new device whose advert carries nothing is left out: it is noise.
     pub(crate) fn ingest_at(&mut self, mut advert: Advert, now: Instant) {
+        if advert.is_empty() && !self.devices.contains_key(&advert.id) {
+            return;
+        }
         let hits = self.db.classify(&advert);
         let device = match self.devices.entry(advert.id.clone()) {
             Entry::Occupied(entry) => {
@@ -327,6 +331,19 @@ mod tests {
     }
 
     #[test]
+    fn empty_adverts_are_left_out() {
+        let mut session = session();
+        session.ingest(Advert { id: "ghost".into(), ..Default::default() });
+        assert!(session.is_empty());
+        assert!(session.followers().is_empty());
+        // A device that sent data before stays when an empty update comes.
+        session.ingest(advert("real", -60));
+        session.ingest(Advert { id: "real".into(), ..Default::default() });
+        assert_eq!(session.len(), 1);
+        assert_eq!(session.get("real").unwrap().updates, 2);
+    }
+
+    #[test]
     fn flagged_devices_sort_first() {
         let mut session = session();
         session.ingest(advert("plain-near", -30));
@@ -511,7 +528,7 @@ mod tests {
     fn first_signal_value_starts_the_average() {
         let mut session = Session::new(db(), None, "office".into());
         assert!(session.is_empty());
-        session.ingest(Advert { id: "a".into(), ..Default::default() });
+        session.ingest(Advert { id: "a".into(), name: Some("Lamp".into()), ..Default::default() });
         assert_eq!(session.get("a").unwrap().rssi_avg, None);
         assert_eq!(session.get("a").unwrap().distance_m(), None);
         session.ingest(advert("a", -60));

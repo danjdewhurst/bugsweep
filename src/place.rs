@@ -1,6 +1,7 @@
 //! A laptop has no GPS. The MAC address of the default gateway identifies
 //! the network, and the network identifies the place.
 
+use std::net::Ipv4Addr;
 use std::process::Command;
 
 pub const UNKNOWN: &str = "unknown";
@@ -40,18 +41,41 @@ fn word_after<'t>(text: &'t str, marker: &str) -> Option<&'t str> {
     text.split_whitespace().skip_while(|word| *word != marker).nth(1)
 }
 
-fn macos_gateway_mac(run: Runner) -> Option<String> {
+fn macos_gateway(run: Runner) -> Option<String> {
     let route = run("route", &["-n", "get", "default"])?;
-    let gateway = route.lines().find_map(|line| line.trim().strip_prefix("gateway:"))?.trim().to_string();
+    Some(route.lines().find_map(|line| line.trim().strip_prefix("gateway:"))?.trim().to_string())
+}
+
+fn linux_gateway(run: Runner) -> Option<String> {
+    let route = run("ip", &["route", "show", "default"])?;
+    Some(word_after(&route, "via")?.to_string())
+}
+
+fn macos_gateway_mac(run: Runner) -> Option<String> {
+    let gateway = macos_gateway(run)?;
     let arp = run("arp", &["-n", &gateway])?;
     normalise_mac(word_after(&arp, "at")?)
 }
 
 fn linux_gateway_mac(run: Runner) -> Option<String> {
-    let route = run("ip", &["route", "show", "default"])?;
-    let gateway = word_after(&route, "via")?.to_string();
+    let gateway = linux_gateway(run)?;
     let neigh = run("ip", &["neigh", "show", &gateway])?;
     normalise_mac(word_after(&neigh, "lladdr")?)
+}
+
+/// The IPv4 address of the default gateway on operating system `os`.
+pub(crate) fn gateway_with(os: &str, run: Runner) -> Option<Ipv4Addr> {
+    let gateway = match os {
+        "macos" => macos_gateway(run),
+        "linux" => linux_gateway(run),
+        _ => None,
+    };
+    gateway?.parse().ok()
+}
+
+/// The IPv4 address of the default gateway of this machine.
+pub(crate) fn gateway() -> Option<Ipv4Addr> {
+    gateway_with(std::env::consts::OS, &output)
 }
 
 /// The place key on operating system `os` (as in `std::env::consts::OS`).
@@ -126,6 +150,21 @@ mod tests {
         assert_eq!(detect_with("linux", &run), UNKNOWN);
         assert_eq!(detect_with("linux", &fake(&[("ip route show default", "")])), UNKNOWN);
         assert_eq!(detect_with("linux", &fake(&[])), UNKNOWN);
+    }
+
+    #[test]
+    fn gateway_addresses() {
+        let mac = fake(&[("route -n get default", "    gateway: 192.168.1.1\n")]);
+        assert_eq!(gateway_with("macos", &mac), Some(Ipv4Addr::new(192, 168, 1, 1)));
+        let linux = fake(&[("ip route show default", "default via 10.0.0.1 dev wlan0\n")]);
+        assert_eq!(gateway_with("linux", &linux), Some(Ipv4Addr::new(10, 0, 0, 1)));
+        // An IPv6 gateway, no gateway, and another system.
+        let v6 = fake(&[("ip route show default", "default via fe80::1 dev wlan0\n")]);
+        assert_eq!(gateway_with("linux", &v6), None);
+        assert_eq!(gateway_with("linux", &fake(&[])), None);
+        assert_eq!(gateway_with("windows", &mac), None);
+        // The result depends on the network of this machine.
+        let _ = gateway();
     }
 
     #[test]
