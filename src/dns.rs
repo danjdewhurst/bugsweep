@@ -33,9 +33,9 @@ pub fn reverse_name(ip: Ipv4Addr) -> String {
     format!("{d}.{c}.{b}.{a}.in-addr.arpa")
 }
 
-/// A PTR query for `name`. The "recursion desired" bit stays off, so a
-/// router answers from its own data (for example its DHCP leases) and does
-/// not send the question of a private address to its upstream DNS.
+/// A PTR query for `name`. The "recursion desired" bit stays off. It asks a
+/// router to answer from its own data (for example its DHCP leases), and
+/// most routers then do not send the question to their upstream DNS.
 pub fn query(id: u16, name: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(18 + name.len());
     out.extend(id.to_be_bytes());
@@ -168,7 +168,9 @@ pub fn service_types(targets: &[String]) -> Vec<String> {
                 }
                 _ => target.as_str(),
             };
-            clean(short, MAX_SERVICE).filter(|kind| kind.starts_with('_'))
+            // Each label of a service type has a "_" and a name.
+            clean(short, MAX_SERVICE)
+                .filter(|kind| kind.split('.').all(|label| label.len() > 1 && label.starts_with('_')))
         })
         .collect();
     types.sort();
@@ -355,6 +357,7 @@ pub(crate) mod tests {
         let many: Vec<String> = (0..40).map(|i| format!("_s{i:02}._tcp.local")).collect();
         assert_eq!(service_types(&many).len(), MAX_SERVICES);
         // A multi-byte character just before the end must not split.
-        assert_eq!(service_types(&["_é.loca".to_string()]), ["_.loca"]);
+        assert_eq!(service_types(&["_é.loca".to_string()]), Vec::<String>::new());
+        assert_eq!(service_types(&["_hap.tcp.local".to_string()]), Vec::<String>::new());
     }
 }

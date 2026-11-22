@@ -50,8 +50,11 @@ const NAME_WAIT: Duration = Duration::from_millis(1200);
 /// All name queries of one sweep end after this time, also on a large
 /// network where many hosts do not answer.
 const NAMES_BUDGET: Duration = Duration::from_millis(2500);
-/// Name queries at the same time. Each query uses one socket.
+/// mDNS queries at the same time. Each query uses one socket.
 const PARALLEL_LOOKUPS: usize = 64;
+/// Queries to the gateway at the same time. They have their own limit, so
+/// slow mDNS queries do not use up the budget before the gateway answers.
+const PARALLEL_GATEWAY_LOOKUPS: usize = 16;
 const DNS_PORT: u16 = 53;
 const MDNS_PORT: u16 = 5353;
 
@@ -432,7 +435,8 @@ fn parse_arp(text: &str) -> BTreeMap<Ipv4Addr, String> {
 async fn dns_exchange(server: SocketAddrV4, query: &[u8], wait: Duration) -> Option<Vec<u8>> {
     let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await.ok()?;
     socket.connect(server).await.ok()?;
-    let mut buffer = vec![0u8; 4096];
+    // The largest mDNS packet (RFC 6762).
+    let mut buffer = vec![0u8; 9000];
     for until in [Instant::now() + wait / 2, Instant::now() + wait] {
         socket.send(query).await.ok()?;
         loop {
@@ -522,15 +526,18 @@ struct Names {
 
 /// The shared limits of the name queries of one sweep.
 struct Lookups {
-    /// Queries at the same time.
-    limit: Semaphore,
+    /// mDNS queries at the same time.
+    mdns: Semaphore,
+    /// Gateway queries at the same time.
+    gateway: Semaphore,
     /// No query waits past this time.
     deadline: tokio::time::Instant,
 }
 
 /// Send one PTR query for `name` to `server`, and return the targets.
 async fn ask(probe: &impl Probe, lookups: &Lookups, server: SocketAddrV4, name: &str) -> Vec<String> {
-    let _permit = lookups.limit.acquire().await;
+    let limit = if server.port() == DNS_PORT { &lookups.gateway } else { &lookups.mdns };
+    let _permit = limit.acquire().await;
     let wait = NAME_WAIT.min(lookups.deadline.saturating_duration_since(tokio::time::Instant::now()));
     if wait.is_zero() {
         return Vec::new();
@@ -614,14 +621,18 @@ pub(crate) async fn sweep_with(probe: &impl Probe) -> Result<LanReport> {
     // The name queries run at the same time as the RTSP probes. They go only
     // to addresses in the swept networks.
     let everyone: BTreeSet<Ipv4Addr> = ips.iter().chain(arp.keys()).copied().filter(in_networks).collect();
-    // The gateway is on the link also when the network is larger than the
-    // swept /24.
-    let gateway = probe.gateway().filter(|ip| networks.iter().any(|n| n.on_link(*ip) && n.local != *ip));
+    // The gateway gets the questions only for the hosts on its own link.
+    // It can be outside the swept /24 of a larger network.
+    let gateway = probe.gateway();
+    let gateway_for = |ip: Ipv4Addr| {
+        gateway.filter(|g| networks.iter().any(|n| n.local != *g && n.on_link(*g) && n.contains(ip)))
+    };
     let limits = Lookups {
-        limit: Semaphore::new(PARALLEL_LOOKUPS),
+        mdns: Semaphore::new(PARALLEL_LOOKUPS),
+        gateway: Semaphore::new(PARALLEL_GATEWAY_LOOKUPS),
         deadline: tokio::time::Instant::now() + NAMES_BUDGET,
     };
-    let lookups = join_all(everyone.iter().map(|ip| names_of(probe, &limits, *ip, gateway)));
+    let lookups = join_all(everyone.iter().map(|ip| names_of(probe, &limits, *ip, gateway_for(*ip))));
     let (mut hosts, names) = tokio::join!(hosts_with_evidence(probe, ips, open, onvif, &arp), lookups);
     let mut names: BTreeMap<Ipv4Addr, Names> = everyone.into_iter().zip(names).collect();
     // A name never changes the verdict or the note: it only adds a hint.
@@ -1207,15 +1218,29 @@ mod tests {
         let network = Network { link_prefix: 22, ..home_network() };
         let ip = Ipv4Addr::new(192, 168, 1, 4);
         let gateway = SocketAddrV4::new(Ipv4Addr::new(192, 168, 0, 1), DNS_PORT);
+        // A host on another network: the gateway gets no question about it.
+        let guest = Network {
+            interface: "en1".into(),
+            local: Ipv4Addr::new(10, 0, 0, 2),
+            base: u32::from(Ipv4Addr::new(10, 0, 0, 0)),
+            prefix: 24,
+            link_prefix: 24,
+        };
+        let other = Ipv4Addr::new(10, 0, 0, 9);
         let probe = FakeProbe {
-            networks: Some(vec![network]),
-            arp: BTreeMap::from([(ip, "00:11:22:00:00:04".into())]),
+            networks: Some(vec![network, guest]),
+            arp: BTreeMap::from([(ip, "00:11:22:00:00:04".into()), (other, "00:11:22:00:00:09".into())]),
             gateway: Some(*gateway.ip()),
-            dns: BTreeMap::from([((gateway, dns::reverse_name(ip)), vec!["box.lan"])]),
+            dns: BTreeMap::from([
+                ((gateway, dns::reverse_name(ip)), vec!["box.lan"]),
+                ((gateway, dns::reverse_name(other)), vec!["leak.lan"]),
+            ]),
             ..FakeProbe::default()
         };
         let report = sweep_with(&probe).await.unwrap();
-        assert_eq!(report.others[0].name.as_deref(), Some("box.lan"));
+        let names: Vec<Option<&str>> = report.others.iter().map(|o| o.name.as_deref()).collect();
+        assert_eq!(names, [None, Some("box.lan")]);
+        assert_eq!(probe.asked.lock().unwrap().iter().filter(|s| **s == gateway).count(), 1);
     }
 
     #[tokio::test(start_paused = true)]

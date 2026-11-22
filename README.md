@@ -171,8 +171,9 @@ can give a false name. A name or a service never changes a verdict or a
 note. Use it only to find the device for a physical check.
 
 - The text keeps only ASCII letters, digits, `-`, `_` and `.`.
-- The query to the gateway does not ask for recursion, so the router answers
-  from its own data and does not send the question to the internet.
+- The query to the gateway does not ask for recursion. Most routers then
+  answer only from their own data (for example their DHCP leases).
+- The gateway gets questions only for the hosts on its own network.
 - On Windows, bugsweep cannot find the gateway yet, so only mDNS names show.
 - The name queries add at most about 2.5 s to the sweep.
 
