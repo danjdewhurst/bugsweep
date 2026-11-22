@@ -163,7 +163,8 @@ mod tests {
         assert_eq!(gateway_with("linux", &v6), None);
         assert_eq!(gateway_with("linux", &fake(&[])), None);
         assert_eq!(gateway_with("windows", &mac), None);
-        // The result depends on the network of this machine.
+        // The result depends on the network of this machine. The call must
+        // not fail.
         let _ = gateway();
     }
 

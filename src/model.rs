@@ -35,6 +35,31 @@ impl Advert {
     }
 }
 
+/// A character that changes the direction of text, hides itself, or breaks
+/// a line. `char::is_control` does not cover these.
+fn is_hidden(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00ad}'
+            | '\u{061c}'
+            | '\u{180e}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{2028}'..='\u{202e}'
+            | '\u{2060}'..='\u{206f}'
+            | '\u{fe00}'..='\u{fe0f}'
+            | '\u{feff}'
+            | '\u{fff9}'..='\u{fffb}'
+            | '\u{e0000}'..='\u{e0fff}'
+    )
+}
+
+/// Device text for a terminal line: no control characters and no hidden
+/// characters, so an advertised name cannot move the cursor, clear the
+/// screen or hide text.
+pub fn printable(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control() && !is_hidden(*c)).collect()
+}
+
 const BASE_UUID_TAIL: u128 = 0x0000_1000_8000_0080_5f9b_34fb;
 
 /// Expand a 16-bit or 32-bit short UUID, or parse a full UUID.
@@ -91,6 +116,12 @@ mod tests {
             Advert { service_data: BTreeMap::from([(uuid, vec![])]), ..empty.clone() },
         ];
         assert!(with_data.iter().all(|advert| !advert.is_empty()));
+    }
+
+    #[test]
+    fn printable_text() {
+        assert_eq!(printable("My \u{1b}[2Jwatch\u{202e}\u{2028}\u{e0041}"), "My [2Jwatch");
+        assert_eq!(printable("Café 🎧"), "Café 🎧");
     }
 
     #[test]

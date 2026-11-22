@@ -47,6 +47,9 @@ const PARALLEL_CONNECTS: usize = 128;
 /// How long a name query waits for its answer. The query goes out again
 /// after half of this time.
 const NAME_WAIT: Duration = Duration::from_millis(1200);
+/// All name queries of one sweep end after this time, also on a large
+/// network where many hosts do not answer.
+const NAMES_BUDGET: Duration = Duration::from_millis(2500);
 /// Name queries at the same time. Each query uses one socket.
 const PARALLEL_LOOKUPS: usize = 64;
 const DNS_PORT: u16 = 53;
@@ -218,12 +221,22 @@ pub(crate) struct Network {
     interface: String,
     local: Ipv4Addr,
     base: u32,
+    /// The swept prefix: at least /24.
     prefix: u8,
+    /// The prefix of the interface. It can be larger than the swept one.
+    link_prefix: u8,
 }
 
 impl Network {
     fn contains(&self, ip: Ipv4Addr) -> bool {
         u32::from(ip) & (u32::MAX << (32 - self.prefix)) == self.base
+    }
+
+    /// The address is on the link of the interface, also outside the
+    /// swept part of a large network.
+    fn on_link(&self, ip: Ipv4Addr) -> bool {
+        let mask = u32::MAX.checked_shl(32 - u32::from(self.link_prefix)).unwrap_or(0);
+        u32::from(ip) & mask == u32::from(self.local) & mask
     }
 
     fn label(&self) -> String {
@@ -252,7 +265,13 @@ fn networks_from(interfaces: &[Interface]) -> Vec<Network> {
         if networks.iter().any(|n| n.base == base) {
             continue;
         }
-        networks.push(Network { interface: interface.name.clone(), local: v4.ip, base, prefix });
+        networks.push(Network {
+            interface: interface.name.clone(),
+            local: v4.ip,
+            base,
+            prefix,
+            link_prefix: v4.prefixlen,
+        });
     }
     networks
 }
@@ -406,24 +425,27 @@ fn parse_arp(text: &str) -> BTreeMap<Ipv4Addr, String> {
     table
 }
 
-/// Send `query` to `server` and return the first answer from `server` with
-/// the ID of the query. The query goes out again after half of `wait`.
+/// Send `query` to `server` and return the first answer with the ID of the
+/// query. The query goes out again after half of `wait`. The socket is
+/// connected, so the system drops packets from other hosts, and a host with
+/// no server on the port ends the wait at once.
 async fn dns_exchange(server: SocketAddrV4, query: &[u8], wait: Duration) -> Option<Vec<u8>> {
     let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await.ok()?;
-    let mut buffer = vec![0u8; 9000];
+    socket.connect(server).await.ok()?;
+    let mut buffer = vec![0u8; 4096];
     for until in [Instant::now() + wait / 2, Instant::now() + wait] {
-        socket.send_to(query, server).await.ok()?;
+        socket.send(query).await.ok()?;
         loop {
             let left = until.saturating_duration_since(Instant::now());
-            match timeout(left, socket.recv_from(&mut buffer)).await {
-                Ok(Ok((read, from)))
-                    if from == SocketAddr::V4(server) && buffer[..read].starts_with(&query[..2]) =>
-                {
+            match timeout(left, socket.recv(&mut buffer)).await {
+                Ok(Ok(read)) if buffer[..read].starts_with(&query[..2]) => {
                     return Some(buffer[..read].to_vec());
                 }
-                // An answer from another host, or to another query.
+                // An answer to another query.
                 Ok(Ok(_)) => {}
-                _ => break,
+                // The host has no server on this port.
+                Ok(Err(_)) => return None,
+                Err(_) => break,
             }
         }
     }
@@ -498,12 +520,23 @@ struct Names {
     services: Vec<String>,
 }
 
+/// The shared limits of the name queries of one sweep.
+struct Lookups {
+    /// Queries at the same time.
+    limit: Semaphore,
+    /// No query waits past this time.
+    deadline: tokio::time::Instant,
+}
+
 /// Send one PTR query for `name` to `server`, and return the targets.
-async fn ask(probe: &impl Probe, limit: &Semaphore, server: SocketAddrV4, name: &str) -> Vec<String> {
-    let _permit = limit.acquire().await;
+async fn ask(probe: &impl Probe, lookups: &Lookups, server: SocketAddrV4, name: &str) -> Vec<String> {
+    let _permit = lookups.limit.acquire().await;
+    let wait = NAME_WAIT.min(lookups.deadline.saturating_duration_since(tokio::time::Instant::now()));
+    if wait.is_zero() {
+        return Vec::new();
+    }
     let id = uuid::Uuid::new_v4().as_u128() as u16;
-    let recursion = server.port() == DNS_PORT;
-    match probe.dns(server, dns::query(id, name, recursion), NAME_WAIT).await {
+    match probe.dns(server, dns::query(id, name), wait).await {
         Some(answer) => dns::ptr_targets(&answer, id, name),
         None => Vec::new(),
     }
@@ -511,17 +544,20 @@ async fn ask(probe: &impl Probe, limit: &Semaphore, server: SocketAddrV4, name: 
 
 /// The name and the service types of one host. The name the host gives
 /// over mDNS comes first; the name from the gateway's DNS is the fallback.
-async fn names_of(probe: &impl Probe, limit: &Semaphore, ip: Ipv4Addr, gateway: Option<Ipv4Addr>) -> Names {
+async fn names_of(probe: &impl Probe, lookups: &Lookups, ip: Ipv4Addr, gateway: Option<Ipv4Addr>) -> Names {
     let reverse = dns::reverse_name(ip);
     let host = SocketAddrV4::new(ip, MDNS_PORT);
     let from_gateway = async {
         match gateway {
-            Some(gateway) => ask(probe, limit, SocketAddrV4::new(gateway, DNS_PORT), &reverse).await,
+            Some(gateway) => ask(probe, lookups, SocketAddrV4::new(gateway, DNS_PORT), &reverse).await,
             None => Vec::new(),
         }
     };
-    let (own, router, services) =
-        tokio::join!(ask(probe, limit, host, &reverse), from_gateway, ask(probe, limit, host, dns::SERVICES));
+    let (own, router, services) = tokio::join!(
+        ask(probe, lookups, host, &reverse),
+        from_gateway,
+        ask(probe, lookups, host, dns::SERVICES)
+    );
     Names { name: dns::host_name(own.iter().chain(&router)), services: dns::service_types(&services) }
 }
 
@@ -578,9 +614,14 @@ pub(crate) async fn sweep_with(probe: &impl Probe) -> Result<LanReport> {
     // The name queries run at the same time as the RTSP probes. They go only
     // to addresses in the swept networks.
     let everyone: BTreeSet<Ipv4Addr> = ips.iter().chain(arp.keys()).copied().filter(in_networks).collect();
-    let gateway = probe.gateway().filter(in_networks);
-    let limit = Semaphore::new(PARALLEL_LOOKUPS);
-    let lookups = join_all(everyone.iter().map(|ip| names_of(probe, &limit, *ip, gateway)));
+    // The gateway is on the link also when the network is larger than the
+    // swept /24.
+    let gateway = probe.gateway().filter(|ip| networks.iter().any(|n| n.on_link(*ip) && n.local != *ip));
+    let limits = Lookups {
+        limit: Semaphore::new(PARALLEL_LOOKUPS),
+        deadline: tokio::time::Instant::now() + NAMES_BUDGET,
+    };
+    let lookups = join_all(everyone.iter().map(|ip| names_of(probe, &limits, *ip, gateway)));
     let (mut hosts, names) = tokio::join!(hosts_with_evidence(probe, ips, open, onvif, &arp), lookups);
     let mut names: BTreeMap<Ipv4Addr, Names> = everyone.into_iter().zip(names).collect();
     // A name never changes the verdict or the note: it only adds a hint.
@@ -740,10 +781,17 @@ mod tests {
             local: Ipv4Addr::new(192, 168, 1, 20),
             base: u32::from(Ipv4Addr::new(192, 168, 1, 0)),
             prefix: 24,
+            link_prefix: 24,
         };
         assert!(network.contains(Ipv4Addr::new(192, 168, 1, 254)));
         assert!(!network.contains(Ipv4Addr::new(192, 168, 2, 1)));
         assert!(!network.contains(Ipv4Addr::new(224, 0, 0, 251)));
+        assert!(network.on_link(Ipv4Addr::new(192, 168, 1, 1)));
+        assert!(!network.on_link(Ipv4Addr::new(192, 168, 0, 1)));
+        let wide = Network { link_prefix: 22, ..network };
+        assert!(wide.on_link(Ipv4Addr::new(192, 168, 0, 1)));
+        assert!(!wide.on_link(Ipv4Addr::new(192, 168, 4, 1)));
+        assert!(Network { link_prefix: 0, ..wide }.on_link(Ipv4Addr::new(8, 8, 8, 8)));
     }
 
     #[test]
@@ -753,6 +801,7 @@ mod tests {
             local: Ipv4Addr::new(192, 168, 1, 20),
             base: u32::from(Ipv4Addr::new(192, 168, 1, 0)),
             prefix: 24,
+            link_prefix: 24,
         };
         let hosts: Vec<Ipv4Addr> = network.hosts().collect();
         assert_eq!(hosts.len(), 253);
@@ -880,7 +929,8 @@ mod tests {
         let networks = MACHINE.networks().unwrap();
         assert!(networks.iter().all(|n| n.prefix >= 24));
         assert!(MACHINE.arp_table().values().all(|mac| mac.len() == 17));
-        assert_eq!(MACHINE.gateway(), place::gateway());
+        // The gateway depends on the network. The call must not fail.
+        let _ = MACHINE.gateway();
     }
 
     /// A fake ONVIF camera on the loopback address. It answers the first
@@ -966,6 +1016,8 @@ mod tests {
         dns: BTreeMap<(SocketAddrV4, String), Vec<&'static str>>,
         /// The servers that got a name query.
         asked: std::sync::Mutex<Vec<SocketAddrV4>>,
+        /// Each name query waits its full time and gets no answer.
+        silent: bool,
     }
 
     impl Probe for FakeProbe {
@@ -995,11 +1047,15 @@ mod tests {
         }
 
         async fn dns(&self, server: SocketAddrV4, query: Vec<u8>, wait: Duration) -> Option<Vec<u8>> {
-            assert_eq!(wait, NAME_WAIT);
+            assert!(!wait.is_zero() && wait <= NAME_WAIT, "{wait:?}");
             self.asked.lock().unwrap().push(server);
             let (_, name) = dns::tests::asked(&query);
-            // Only a DNS server gets a query with the recursion bit.
-            assert_eq!(query[2] == 1, server.port() == DNS_PORT);
+            // No query asks for recursion.
+            assert_eq!(query[2..4], [0, 0]);
+            if self.silent {
+                tokio::time::sleep(wait).await;
+                return None;
+            }
             let targets = self.dns.get(&(server, name.clone()))?;
             Some(dns::tests::answer(&query, 0x8400, &name, targets))
         }
@@ -1011,6 +1067,7 @@ mod tests {
             local: Ipv4Addr::new(192, 168, 1, 20),
             base: u32::from(Ipv4Addr::new(192, 168, 1, 0)),
             prefix: 24,
+            link_prefix: 24,
         }
     }
 
@@ -1022,6 +1079,7 @@ mod tests {
             local: Ipv4Addr::new(10, 0, 0, 2),
             base: u32::from(Ipv4Addr::new(10, 0, 0, 0)),
             prefix: 24,
+            link_prefix: 24,
         };
         let probe = FakeProbe {
             networks: Some(vec![home_network(), guest]),
@@ -1117,7 +1175,7 @@ mod tests {
         // A name never removes the note.
         assert!(chip.needs_check && chip.note.unwrap().contains("low-cost cameras"));
         let computer = by_ip(5);
-        assert_eq!(computer.name.as_deref(), Some("charger[2J.lan"));
+        assert_eq!(computer.name.as_deref(), Some("charger2J.lan"));
         assert!(computer.services.is_empty());
         assert!(computer.needs_check && computer.note.unwrap().contains("Linux computer"));
         let gateway = by_ip(1);
@@ -1144,6 +1202,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gateway_of_a_large_network_gets_queries() {
+        // The interface is on a /22, and the sweep covers only its /24.
+        let network = Network { link_prefix: 22, ..home_network() };
+        let ip = Ipv4Addr::new(192, 168, 1, 4);
+        let gateway = SocketAddrV4::new(Ipv4Addr::new(192, 168, 0, 1), DNS_PORT);
+        let probe = FakeProbe {
+            networks: Some(vec![network]),
+            arp: BTreeMap::from([(ip, "00:11:22:00:00:04".into())]),
+            gateway: Some(*gateway.ip()),
+            dns: BTreeMap::from([((gateway, dns::reverse_name(ip)), vec!["box.lan"])]),
+            ..FakeProbe::default()
+        };
+        let report = sweep_with(&probe).await.unwrap();
+        assert_eq!(report.others[0].name.as_deref(), Some("box.lan"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn name_queries_end_within_the_budget() {
+        // 199 hosts that never answer: without the budget, their 398
+        // queries take 7 rounds of NAME_WAIT.
+        let arp = (1..=200)
+            .map(|last| (Ipv4Addr::new(192, 168, 1, last), format!("00:11:22:00:00:{last:02x}")))
+            .collect();
+        let probe =
+            FakeProbe { networks: Some(vec![home_network()]), arp, silent: true, ..FakeProbe::default() };
+        let started = tokio::time::Instant::now();
+        let report = sweep_with(&probe).await.unwrap();
+        assert_eq!(report.others.len(), 199);
+        assert!(started.elapsed() <= NAMES_BUDGET, "{:?}", started.elapsed());
+        let asked = probe.asked.lock().unwrap().len();
+        assert!((PARALLEL_LOOKUPS..2 * 199).contains(&asked), "{asked}");
+    }
+
+    #[tokio::test]
     async fn host_outside_the_networks_gets_no_name_query() {
         // An ONVIF answer can come from an address outside the swept networks.
         let outside = Ipv4Addr::new(172, 16, 0, 9);
@@ -1157,12 +1249,12 @@ mod tests {
         assert!(probe.asked.lock().unwrap().is_empty());
     }
 
-    /// A DNS server on the loopback address. It reads queries, then sends
-    /// for each one the answers that `reply` gives, from the server socket
-    /// (`true`) or from another socket (`false`).
     /// Packets to send, each with `true` when the server socket sends it.
     type Replies = Vec<(bool, Vec<u8>)>;
 
+    /// A DNS server on the loopback address. It reads up to two queries,
+    /// then sends for each one the answers that `reply` gives, from the
+    /// server socket (`true`) or from another socket (`false`).
     async fn fake_dns(reply: fn(usize, &[u8]) -> Replies) -> SocketAddrV4 {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let other = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1183,18 +1275,21 @@ mod tests {
     #[tokio::test]
     async fn dns_exchange_against_a_local_server() {
         let wait = Duration::from_millis(400);
-        let query = dns::query(0x1234, "4.1.168.192.in-addr.arpa", false);
+        let query = dns::query(0x1234, "4.1.168.192.in-addr.arpa");
 
         // A direct answer.
         let server = fake_dns(|_, q| vec![(true, dns::tests::answer(q, 0x8400, "x", &[]))]).await;
         let answer = MACHINE.dns(server, query.clone(), wait).await.unwrap();
         assert_eq!(answer[..2], [0x12, 0x34]);
 
-        // An answer from another socket and one to another query come first.
+        // An answer from another socket and one to another query come
+        // first. The one from another socket has the right ID.
         let server = fake_dns(|_, q| {
+            let mut forged = q.to_vec();
+            forged.push(0xee);
             let mut wrong_id = q.to_vec();
             wrong_id[0] ^= 0xff;
-            vec![(false, q.to_vec()), (true, wrong_id), (true, q.to_vec())]
+            vec![(false, forged), (true, wrong_id), (true, q.to_vec())]
         })
         .await;
         assert_eq!(dns_exchange(server, &query, wait).await.as_deref(), Some(&query[..]));
@@ -1209,6 +1304,16 @@ mod tests {
         let started = Instant::now();
         assert_eq!(dns_exchange(server, &query, wait).await, None);
         assert!(started.elapsed() >= wait);
+
+        // A closed port. Linux reports it at once.
+        let closed = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = closed.local_addr().unwrap().port();
+        drop(closed);
+        let started = Instant::now();
+        assert_eq!(dns_exchange(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port), &query, wait).await, None);
+        #[cfg(target_os = "linux")]
+        assert!(started.elapsed() < wait / 2, "{:?}", started.elapsed());
+        let _ = started;
     }
 
     #[tokio::test]

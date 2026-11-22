@@ -786,6 +786,7 @@ pub fn others_summary(report: &LanReport) -> String {
     let mut text = format!("{} other host(s) answered.", report.others.len());
     match check.count() {
         0 => {}
+        1 => text.push_str(&format!(" 1 of them needs a look ({}).", vendors.join(", "))),
         count => text.push_str(&format!(" {count} of them need a look ({}).", vendors.join(", "))),
     }
     text
@@ -1390,7 +1391,7 @@ mod tests {
         let screen = render(&mut app);
         assert!(
             screen.contains(
-                "1 host(s) with camera evidence. 3 other host(s) answered. 1 of them need a look (Espressif Inc.)."
+                "1 host(s) with camera evidence. 3 other host(s) answered. 1 of them needs a look (Espressif Inc.)."
             ),
             "{screen}"
         );

@@ -16,7 +16,7 @@ use serde_json::json;
 use crate::ble::BleEvent;
 use crate::identity;
 use crate::lan::{LanReport, Verdict};
-use crate::model::uuid_label;
+use crate::model::{printable, uuid_label};
 use crate::place;
 use crate::session::{Session, follow_text};
 use crate::signatures::SignatureDb;
@@ -283,6 +283,7 @@ fn print_scan_json(session: &Session, flagged_only: bool, out: &mut dyn Write) -
                 "known": device.known,
                 "other_places": device.follow().map(|f| f.places).unwrap_or(0),
                 "other_places_match": device.follow().map(|f| f.basis.label()),
+                "keys": device.keys(),
                 "findings": device.hits.iter().map(|&i| session.db().get(i).id.clone()).collect::<Vec<_>>(),
                 "company_ids": advert.manufacturer_data.keys().map(|id| format!("{id:#06x}")).collect::<Vec<_>>(),
                 "services": advert.services.iter().map(uuid_label).collect::<Vec<_>>(),
@@ -426,9 +427,12 @@ fn run_known(store: &Store, action: &KnownCmd, out: &mut dyn Write) -> Result<()
             for key in keys(ids)? {
                 let (seen, title) = store.seen(&key)?;
                 store.set_known(&key, title.as_deref(), true)?;
-                let title = title.map(|title| format!(" ({title})")).unwrap_or_default();
+                let title = title.map(|title| format!(" ({})", printable(&title))).unwrap_or_default();
                 let unseen = if seen { "" } else { " The log has no sighting of it yet." };
-                writeln!(out, "Marked {key}{title} as known.{unseen}")?;
+                writeln!(out, "Marked {}{title} as known.{unseen}", printable(&key))?;
+                if identity::is_copyable(&key) {
+                    writeln!(out, "  Each other device that sends this name or data is now known too.")?;
+                }
             }
             Ok(())
         }
@@ -437,9 +441,9 @@ fn run_known(store: &Store, action: &KnownCmd, out: &mut dyn Write) -> Result<()
             for key in keys(ids)? {
                 if marked.contains(&key) {
                     store.set_known(&key, None, false)?;
-                    writeln!(out, "Removed the known mark from {key}.")?;
+                    writeln!(out, "Removed the known mark from {}.", printable(&key))?;
                 } else {
-                    writeln!(out, "{key} is not marked as known.")?;
+                    writeln!(out, "{} is not marked as known.", printable(&key))?;
                 }
             }
             Ok(())
@@ -459,7 +463,8 @@ fn list_known(store: &Store, as_json: bool, out: &mut dyn Write) -> Result<()> {
         writeln!(out, "No device is marked as known.")?;
     }
     for k in known {
-        writeln!(out, "{}  {}", k.key, k.title.as_deref().unwrap_or("(no name)"))?;
+        let title = k.title.as_deref().map(printable).unwrap_or_else(|| "(no name)".into());
+        writeln!(out, "{}  {title}", printable(&k.key))?;
     }
     Ok(())
 }
@@ -661,6 +666,9 @@ mod tests {
         assert_eq!(tag["flagged"], true);
         assert_eq!(tag["other_places"], 1);
         assert_eq!(tag["other_places_match"], "ID");
+        let keys = tag["keys"].as_array().unwrap();
+        assert_eq!(keys[0], "id:tag-1");
+        assert!(keys[1].as_str().unwrap().starts_with("findmy:"), "{keys:?}");
         assert_eq!(tag["findings"][0], "apple-airtag-separated");
         assert_eq!(tag["company_ids"][0], "0x004c");
         assert_eq!(tag["services"][0], tag["service_data"][0]);
@@ -791,7 +799,7 @@ mod tests {
         assert!(lines[2].starts_with("maybe   192.168.1.6      -"), "{out}");
         assert_eq!(
             lines[3],
-            "2 other host(s) answered. 1 of them need a look (Espressif Inc.). Use --all to list them."
+            "2 other host(s) answered. 1 of them needs a look (Espressif Inc.). Use --all to list them."
         );
         assert!(err.starts_with("Sweeping the local network"), "{err}");
         assert!(err.contains("stays hidden"), "{err}");
@@ -862,6 +870,7 @@ mod tests {
         let db = db_arg(&dir);
         let store = Store::open(Path::new(&db)).unwrap();
         store.record("id:PHONE-1", "home", Some(-40), Some("My phone"), None).unwrap();
+        store.record("id:evil", "home", None, Some("Tag\u{1b}[2J"), None).unwrap();
         store.record("findmy:abcd", "home", None, None, None).unwrap();
         drop(store);
         let known = |args: &[&str]| {
@@ -871,21 +880,25 @@ mod tests {
 
         assert_eq!(known(&["list"]).unwrap(), "No device is marked as known.\n");
         // A bare ID from `scan --json` and keys from `followers` work.
-        let out = known(&["add", "PHONE-1", "findmy:abcd", "name:Desk lamp"]).unwrap();
+        let out = known(&["add", "PHONE-1", "FINDMY:ABCD", "name: Desk lamp"]).unwrap();
         assert_eq!(
             out,
             "Marked id:PHONE-1 (My phone) as known.\n\
              Marked findmy:abcd as known.\n\
-             Marked name:Desk lamp as known. The log has no sighting of it yet.\n"
+             Marked name:Desk lamp as known. The log has no sighting of it yet.\n\
+             \x20 Each other device that sends this name or data is now known too.\n"
         );
+        // Device text reaches the terminal without control characters.
+        assert_eq!(known(&["add", "evil"]).unwrap(), "Marked id:evil (Tag[2J) as known.\n");
         let out = known(&["list"]).unwrap();
         assert!(out.contains("id:PHONE-1  My phone\n"), "{out}");
         assert!(out.contains("findmy:abcd  (no name)\n"), "{out}");
-        assert_eq!(out.lines().count(), 3, "{out}");
+        assert!(out.contains("id:evil  Tag[2J\n"), "{out}");
+        assert_eq!(out.lines().count(), 4, "{out}");
 
         let value: serde_json::Value = serde_json::from_str(&known(&["list", "--json"]).unwrap()).unwrap();
         let list = value["known"].as_array().unwrap();
-        assert_eq!(list.len(), 3);
+        assert_eq!(list.len(), 4);
         let phone = list.iter().find(|k| k["key"] == "id:PHONE-1").unwrap();
         assert_eq!(phone["title"], "My phone");
         assert!(phone["added"].as_i64().unwrap() > 0);
@@ -978,6 +991,20 @@ mod tests {
         check_write_errors(&Fake::new(Vec::new), &["--db", &db, "known", "add", "tag-1"]);
         check_write_errors(&Fake::new(Vec::new), &["--db", &db, "known", "list"]);
         check_write_errors(&Fake::new(Vec::new), &["--db", &db, "known", "list", "--json"]);
+        check_write_errors(&Fake::new(Vec::new), &["--db", &db, "known", "add", "name:Tag"]);
+        // Each run of a removal must find the mark, so mark the key again
+        // before each run.
+        let remove = command_line(&["--db", &db, "known", "remove", "tag-1"]);
+        let removed = "Removed the known mark from id:tag-1.\n".len();
+        for size in [0, removed - 1] {
+            Store::open(Path::new(&db)).unwrap().set_known("id:tag-1", None, true).unwrap();
+            let mut small = vec![0u8; size];
+            let mut full = std::io::Cursor::new(&mut small[..]);
+            let error =
+                run(remove.clone(), &Fake::new(Vec::new), Output { out: &mut full, err: &mut Vec::new() })
+                    .unwrap_err();
+            assert!(error.downcast_ref::<std::io::Error>().is_some(), "{error}");
+        }
         check_write_errors(&Fake::new(Vec::new), &["--db", &db, "known", "remove", "tag-1", "tag-2"]);
     }
 }

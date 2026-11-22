@@ -974,6 +974,17 @@ name_regex = "^InfoTag"
 
         deliver(&mut harness, AppEvent::Lan(Ok(report(Vec::new()))));
         assert!(has(&harness, "No camera evidence found. 1 other host(s) answered."));
+
+        let mut chip = report(Vec::new());
+        chip.others[0].needs_check = true;
+        chip.others[0].name = Some("heat-hub.local".into());
+        click(&mut harness, "Sweep again");
+        deliver(&mut harness, AppEvent::Lan(Ok(chip)));
+        assert!(has(
+            &harness,
+            "No camera evidence found. 1 other host(s) answered. 1 of them needs a look (Router Maker)."
+        ));
+        assert!(has(&harness, "Router Maker; name: heat-hub.local"));
     }
 
     #[test]

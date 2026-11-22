@@ -3,7 +3,8 @@
 //! query and reads one answer. The network code is in `lan`.
 //!
 //! Names and services come from the devices on the network, so they are
-//! untrusted text. [`clean`] removes control characters and limits the length.
+//! untrusted text. [`clean`] keeps only the characters of a host name and
+//! limits the length.
 
 use std::net::Ipv4Addr;
 
@@ -21,6 +22,10 @@ const MAX_SERVICE: usize = 48;
 const MAX_SERVICES: usize = 16;
 /// Most compression pointers in one name. More means a loop.
 const MAX_JUMPS: usize = 16;
+/// Longest name on the wire, in bytes (RFC 1035).
+const MAX_WIRE_NAME: usize = 255;
+/// Most PTR targets that the parser keeps from one answer.
+const MAX_TARGETS: usize = 32;
 
 /// The reverse name of an address, for example "4.1.168.192.in-addr.arpa".
 pub fn reverse_name(ip: Ipv4Addr) -> String {
@@ -28,15 +33,14 @@ pub fn reverse_name(ip: Ipv4Addr) -> String {
     format!("{d}.{c}.{b}.{a}.in-addr.arpa")
 }
 
-/// A PTR query for `name`. `recursion` asks a DNS server to look further;
-/// mDNS does not use it.
-pub fn query(id: u16, name: &str, recursion: bool) -> Vec<u8> {
-    let flags: u16 = if recursion { 0x0100 } else { 0 };
+/// A PTR query for `name`. The "recursion desired" bit stays off, so a
+/// router answers from its own data (for example its DHCP leases) and does
+/// not send the question of a private address to its upstream DNS.
+pub fn query(id: u16, name: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(18 + name.len());
     out.extend(id.to_be_bytes());
-    out.extend(flags.to_be_bytes());
-    // One question, no records.
-    out.extend([0, 1, 0, 0, 0, 0, 0, 0]);
+    // No flags, one question, no records.
+    out.extend([0, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
     for label in name.split('.') {
         out.push(label.len() as u8);
         out.extend(label.as_bytes());
@@ -58,12 +62,17 @@ fn read_name(packet: &[u8], start: usize) -> Option<(String, usize)> {
     let mut at = start;
     let mut after = None;
     let mut jumps = 0;
+    let mut wire_length = 1;
     loop {
         let length = usize::from(*packet.get(at)?);
         match length & 0xc0 {
             0 if length == 0 => break,
             0 => {
                 let label = packet.get(at + 1..at + 1 + length)?;
+                wire_length += 1 + length;
+                if wire_length > MAX_WIRE_NAME {
+                    return None;
+                }
                 labels.push(String::from_utf8_lossy(label).into_owned());
                 at += 1 + length;
             }
@@ -101,6 +110,9 @@ pub fn ptr_targets(packet: &[u8], id: u16, name: &str) -> Vec<String> {
         at = after + 4;
     }
     for _ in 0..answers {
+        if targets.len() == MAX_TARGETS {
+            break;
+        }
         let Some((owner, after)) = read_name(packet, at) else { break };
         let (Some(kind), Some(class), Some(length)) =
             (u16_at(packet, after), u16_at(packet, after + 2), u16_at(packet, after + 8))
@@ -120,17 +132,15 @@ pub fn ptr_targets(packet: &[u8], id: u16, name: &str) -> Vec<String> {
     targets
 }
 
-/// A character that changes the direction of text or hides itself.
-fn is_hidden_format(c: char) -> bool {
-    matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2069}' | '\u{feff}')
-}
-
-/// Device text made safe to show: no control characters, no hidden format
-/// characters, no space or final dot at the ends, and at most `max`
-/// characters. `None` when nothing is left.
+/// Device text made safe to show. Host names and service types use only
+/// ASCII letters, digits, "-", "_" and ".", so every other character is
+/// removed: control characters, hidden Unicode, spaces and punctuation that
+/// could fake another field. Dots at the ends are removed too, and the text
+/// gets at most `max` characters. `None` when nothing is left.
 pub fn clean(text: &str, max: usize) -> Option<String> {
-    let kept: String = text.chars().filter(|c| !c.is_control() && !is_hidden_format(*c)).collect();
-    let kept = kept.trim().trim_end_matches('.').trim_end();
+    let kept: String =
+        text.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')).collect();
+    let kept = kept.trim_matches('.');
     if kept.is_empty() {
         return None;
     }
@@ -220,19 +230,18 @@ pub(crate) mod tests {
 
     #[test]
     fn query_layout() {
-        let packet = query(0xbeef, "a.bc", true);
+        let packet = query(0xbeef, "a.bc");
         assert_eq!(
             packet,
-            [0xbe, 0xef, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, b'a', 2, b'b', b'c', 0, 0, 12, 0, 1]
+            [0xbe, 0xef, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, b'a', 2, b'b', b'c', 0, 0, 12, 0, 1]
         );
-        assert_eq!(query(1, "x", false)[2..4], [0, 0]);
         assert_eq!(asked(&packet), (0xbeef, "a.bc".to_string()));
     }
 
     #[test]
     fn ptr_answer_round_trip() {
         let name = reverse_name(Ipv4Addr::new(10, 0, 0, 7));
-        let ask = query(7, &name, false);
+        let ask = query(7, &name);
         let packet = answer(&ask, 0x8400, &name, &["heat-hub.local", "other.local"]);
         assert_eq!(ptr_targets(&packet, 7, &name), ["heat-hub.local", "other.local"]);
         // Case does not matter for the owner name.
@@ -242,7 +251,7 @@ pub(crate) mod tests {
     #[test]
     fn wrong_answers_give_nothing() {
         let name = "4.1.168.192.in-addr.arpa";
-        let ask = query(9, name, true);
+        let ask = query(9, name);
         let good = answer(&ask, 0x8180, name, &["box.lan"]);
         assert_eq!(ptr_targets(&good, 9, name), ["box.lan"]);
         // Another ID, a query and not an answer, and an error code.
@@ -257,7 +266,7 @@ pub(crate) mod tests {
     #[test]
     fn records_of_other_types_are_skipped() {
         let name = "_services._dns-sd._udp.local";
-        let mut packet = answer(&query(3, name, false), 0x8400, name, &["_hap._tcp.local"]);
+        let mut packet = answer(&query(3, name), 0x8400, name, &["_hap._tcp.local"]);
         // Two answers: an A record first, then the PTR record.
         packet[7] = 2;
         let question_end = 12 + name.len() + 2 + 4;
@@ -269,7 +278,7 @@ pub(crate) mod tests {
     #[test]
     fn broken_packets_end_the_parse() {
         let name = "x.local";
-        let ask = query(5, name, false);
+        let ask = query(5, name);
         let good = answer(&ask, 0x8400, name, &["a.local", "b.local"]);
         // Each cut gives no panic and at most the records before it.
         for end in 0..good.len() {
@@ -297,12 +306,30 @@ pub(crate) mod tests {
         assert_eq!(read_name(&[0xc0], 0), None);
         assert_eq!(read_name(&[5, b'a'], 0), None);
         assert_eq!(read_name(&[0x80, 0], 0), None);
+        // A name longer than 255 bytes, made from pointers to one label.
+        let mut long = vec![63];
+        long.extend([b'x'; 63]);
+        long.extend([0xc0, 0]);
+        assert_eq!(read_name(&long, 0), None);
+    }
+
+    #[test]
+    fn many_targets_are_capped() {
+        let name = "_services._dns-sd._udp.local";
+        let targets: Vec<String> = (0..50).map(|i| format!("_s{i}._tcp.local")).collect();
+        let refs: Vec<&str> = targets.iter().map(String::as_str).collect();
+        let packet = answer(&query(4, name), 0x8400, name, &refs);
+        assert_eq!(ptr_targets(&packet, 4, name).len(), MAX_TARGETS);
     }
 
     #[test]
     fn device_text_is_cleaned() {
         assert_eq!(clean("  heat-hub.local. ", 80).as_deref(), Some("heat-hub.local"));
-        assert_eq!(clean("cam\u{1b}[31m\u{202e}era\n", 80).as_deref(), Some("cam[31mera"));
+        assert_eq!(clean("cam\u{1b}[31m\u{202e}era\n", 80).as_deref(), Some("cam31mera"));
+        // Hidden Unicode, line separators and text that fakes another field.
+        let hidden = "hub\u{e0041}\u{e0042}\u{fe0f}\u{061c}\u{2028}\u{00ad}.local";
+        assert_eq!(clean(hidden, 80).as_deref(), Some("hub.local"));
+        assert_eq!(clean("x; services: _ipp._tcp (safe)", 80).as_deref(), Some("xservices_ipp._tcpsafe"));
         assert_eq!(clean("\u{7}\u{200b} . ", 80), None);
         assert_eq!(clean("abcdef", 4).as_deref(), Some("abc…"));
         assert_eq!(clean("abcd", 4).as_deref(), Some("abcd"));
@@ -328,6 +355,6 @@ pub(crate) mod tests {
         let many: Vec<String> = (0..40).map(|i| format!("_s{i:02}._tcp.local")).collect();
         assert_eq!(service_types(&many).len(), MAX_SERVICES);
         // A multi-byte character just before the end must not split.
-        assert!(service_types(&["_é.loca".to_string()]).len() == 1);
+        assert_eq!(service_types(&["_é.loca".to_string()]), ["_.loca"]);
     }
 }

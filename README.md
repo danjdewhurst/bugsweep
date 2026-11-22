@@ -170,6 +170,12 @@ host on UDP port 5353. The results are in `name` (for example
 can give a false name. A name or a service never changes a verdict or a
 note. Use it only to find the device for a physical check.
 
+- The text keeps only ASCII letters, digits, `-`, `_` and `.`.
+- The query to the gateway does not ask for recursion, so the router answers
+  from its own data and does not send the question to the internet.
+- On Windows, bugsweep cannot find the gateway yet, so only mDNS names show.
+- The name queries add at most about 2.5 s to the sweep.
+
 ## Places and the follower check
 
 A laptop has no GPS. By default the place is a key made from the MAC address
@@ -181,12 +187,21 @@ The log is a SQLite file in the user data directory
 leaves the machine. Sightings older than 90 days are deleted. Mark your own
 devices with `m` (or `bugsweep known add`), or they show as followers.
 
-`bugsweep known add` takes the `id` from `scan --json` or a key that
-`followers` prints (`id:…`, `name:…`, `findmy:…` and so on). A device can
-have more than one key. When bugsweep next sees a device with a known key, it
-marks all keys of that device. To remove the mark from a device, remove each
-of its keys that `known list` shows. If you do not, bugsweep marks the device
-again the next time that it sees it.
+`bugsweep known add` takes the `id` from `scan --json`, a key from the
+`keys` list of `scan --json`, or a key that `followers` prints (`id:…`,
+`name:…`, `findmy:…` and so on). A device can have more than one key.
+
+- When bugsweep next sees a device with a known key, it marks all keys of
+  that device.
+- `followers` shows one key for each device. After you mark it, `followers`
+  can show another key of the same device. Check it, and mark it too if the
+  device is yours.
+- A mark on a `name:`, `data:` or `svc:` key also hides each other device
+  that sends the same name or data. A planted tracker can copy a name. Prefer
+  the `id:` key and the tracker keys (`findmy:`, `fmdn:`, `smarttag:`).
+- To remove the mark from a device, remove each of its keys that
+  `known list` shows. If you do not, bugsweep marks the device again the next
+  time that it sees it.
 
 Most devices change their Bluetooth address every few minutes, and the
 platform ID changes with it. bugsweep therefore keeps more than one identity

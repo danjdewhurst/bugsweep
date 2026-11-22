@@ -190,11 +190,14 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Whether the log has a sighting of the key, and a title that the log
-    /// has for it.
+    /// Whether the log has a sighting of the key, and the title of its
+    /// latest sighting with a title.
     pub fn seen(&self, key: &str) -> Result<(bool, Option<String>)> {
         let (count, title): (i64, Option<String>) = self.conn.query_row(
-            "SELECT COUNT(*), MAX(title) FROM sightings WHERE key = ?1",
+            "SELECT COUNT(*),
+                    (SELECT title FROM sightings WHERE key = ?1 AND title IS NOT NULL
+                     ORDER BY last_seen DESC LIMIT 1)
+             FROM sightings WHERE key = ?1",
             params![key],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
@@ -407,6 +410,19 @@ mod tests {
         assert!(store.seen("id:tag").is_err());
         assert!(store.followers().is_err());
         assert!(store.prune().is_err());
+    }
+
+    #[test]
+    fn seen_gives_the_latest_title() {
+        let store = Store::in_memory().unwrap();
+        assert_eq!(store.seen("id:tag").unwrap(), (false, None));
+        store.record("id:tag", "home", None, Some("Old tag"), None).unwrap();
+        store.record("id:tag", "office", None, Some("My phone"), None).unwrap();
+        store.record("id:tag", "car", None, None, None).unwrap();
+        store.conn.execute("UPDATE sightings SET last_seen = 10 WHERE place = 'home'", []).unwrap();
+        store.conn.execute("UPDATE sightings SET last_seen = 20 WHERE place = 'office'", []).unwrap();
+        store.conn.execute("UPDATE sightings SET last_seen = 30 WHERE place = 'car'", []).unwrap();
+        assert_eq!(store.seen("id:tag").unwrap(), (true, Some("My phone".into())));
     }
 
     #[test]

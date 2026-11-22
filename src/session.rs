@@ -69,6 +69,13 @@ impl Device {
         self.follow.filter(|_| !self.known)
     }
 
+    /// All identity keys of the device, strongest first, as the log
+    /// stores them.
+    pub fn keys(&self) -> Vec<String> {
+        let stable = self.payload_since.elapsed() >= PAYLOAD_STABLE_AFTER;
+        identity::keys(&self.advert, stable).into_iter().map(|key| key.text).collect()
+    }
+
     pub fn age(&self) -> Duration {
         self.last_seen.elapsed()
     }
@@ -120,12 +127,13 @@ impl Session {
     }
 
     /// Take in the advertisement data of one device, received at `now`. A
-    /// new device whose advert carries nothing is left out: it is noise.
+    /// new device whose advert carries nothing and matches no signature is
+    /// left out: it is noise. An address alone can match a signature.
     pub(crate) fn ingest_at(&mut self, mut advert: Advert, now: Instant) {
-        if advert.is_empty() && !self.devices.contains_key(&advert.id) {
+        let hits = self.db.classify(&advert);
+        if advert.is_empty() && hits.is_empty() && !self.devices.contains_key(&advert.id) {
             return;
         }
-        let hits = self.db.classify(&advert);
         let device = match self.devices.entry(advert.id.clone()) {
             Entry::Occupied(entry) => {
                 let device = entry.into_mut();
@@ -335,12 +343,21 @@ mod tests {
         let mut session = session();
         session.ingest(Advert { id: "ghost".into(), ..Default::default() });
         assert!(session.is_empty());
-        assert!(session.followers().is_empty());
+        // Nothing went to the log.
+        let store = session.store.as_ref().unwrap();
+        assert_eq!(store.seen("id:ghost").unwrap(), (false, None));
+        // An address that matches a signature is data: it stays.
+        let axon =
+            Advert { id: "cam".into(), address: Some("00:25:DF:00:00:01".into()), ..Default::default() };
+        assert!(axon.is_empty());
+        session.ingest(axon);
+        assert!(session.get("cam").is_some_and(|device| !device.hits.is_empty()));
         // A device that sent data before stays when an empty update comes.
         session.ingest(advert("real", -60));
         session.ingest(Advert { id: "real".into(), ..Default::default() });
-        assert_eq!(session.len(), 1);
+        assert_eq!(session.len(), 2);
         assert_eq!(session.get("real").unwrap().updates, 2);
+        assert_eq!(session.get("real").unwrap().keys(), ["id:real"]);
     }
 
     #[test]

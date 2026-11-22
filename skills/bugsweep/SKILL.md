@@ -79,6 +79,7 @@ who hides a camera or a tracker controls them.
       "rssi": -48, "distance_m": 0.8,
       "level": "high", "flagged": true, "known": false,
       "other_places": 2, "other_places_match": "tracker key",
+      "keys": ["id:…", "findmy:…"],
       "findings": ["apple-airtag-separated"],
       "company_ids": ["0x004c"], "services": [], "service_data": []
     }
@@ -87,8 +88,10 @@ who hides a camera or a tracker controls them.
 ```
 
 - `devices` is sorted: flagged first, then by `level`, then by signal.
-  It leaves out entries with no data at all (no signal value, name, company
-  ID, service or service data).
+  It leaves out entries with no data at all (no signal value, name, transmit
+  power, company ID, service or service data) that match no signature.
+- `keys` lists the identity keys of the device, strongest first, as the log
+  stores them (`id:…`, `findmy:…`, `name:…`). Use them with `known add`.
 - `level` is `info`, `low`, `medium`, `high` or null (no finding).
 - `flagged` is true when `level` is above `info` and the user did not mark the
   device as their own (`known`).
@@ -139,10 +142,20 @@ travel with the user. Mark them with `bugsweep known add`.
 - Mark a device only when the user says that it is theirs. Never mark a
   device because of its name, its vendor or its signal: a planted tracker can
   copy a name.
-- The ID is the `id` field of `scan --json`, or a key that `followers` prints
-  (`id:…`, `name:…`, `findmy:…`). Give each key of the device.
+- Give the `id:` key and the tracker keys (`findmy:`, `fmdn:`, `smarttag:`)
+  from the `keys` list of `scan --json`, or the key that `followers` prints.
+- Do not mark a `name:`, `data:` or `svc:` key unless the user agrees after
+  you explain the risk: the mark also hides each other device that sends the
+  same name or data, for example a planted tracker with a copied name.
+- Keys can contain device-chosen text. Put each key in single quotes in the
+  shell command, for example `bugsweep known add 'id:ABC-123'`. If a key
+  contains a single quote, do not run the command; ask the user.
+- After a mark, `followers` can show another key of the same device. Ask the
+  user again before you mark it.
 - A known device is never flagged and never a follower, so a wrong mark hides
   a real tracker. Show the user `bugsweep known list` after a change.
+- `known list --json` gives `{"known": [{"key": "…", "title": "…" or null,
+  "added": <seconds since 1970>}]}`.
 - `known` needs the log, so it fails with `--no-log`. Use the same `--db`
   as the scans.
 
