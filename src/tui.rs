@@ -504,16 +504,13 @@ impl<'a> App<'a> {
                             report.networks.join(", ")
                         )),
                         if report.hosts.is_empty() {
-                            Line::from(format!(
-                                "No camera evidence found. {} other host(s) answered.",
-                                report.others.len()
-                            ))
-                            .green()
+                            Line::from(format!("No camera evidence found. {}", others_summary(report)))
+                                .green()
                         } else {
                             Line::from(format!(
-                                "{} host(s) with camera evidence. {} other host(s) answered.",
+                                "{} host(s) with camera evidence. {}",
                                 report.hosts.len(),
-                                report.others.len()
+                                others_summary(report)
                             ))
                             .yellow()
                         },
@@ -751,14 +748,48 @@ impl FinderReading {
     }
 }
 
-/// The vendor and note of a network host without camera evidence.
+/// The vendor, note, name and services of a network host without camera
+/// evidence.
 pub(crate) fn neighbour_detail(other: &Neighbour) -> String {
-    match (&other.vendor, other.note) {
+    let detail = match (&other.vendor, other.note) {
         (Some(vendor), Some(note)) => format!("{vendor} ({note})"),
         (Some(vendor), None) => vendor.clone(),
         (None, Some(note)) => note.to_string(),
         (None, None) => "unknown vendor".to_string(),
+    };
+    format!("{detail}{}", name_suffix(other.name.as_deref(), &other.services))
+}
+
+/// "; name: hub.local; services: _hap._tcp, _meshcop._udp", or "" when the
+/// host gave no name and no services. The host chose this text.
+pub fn name_suffix(name: Option<&str>, services: &[String]) -> String {
+    let mut text = String::new();
+    if let Some(name) = name {
+        text.push_str(&format!("; name: {name}"));
     }
+    if !services.is_empty() {
+        text.push_str(&format!("; services: {}", services.join(", ")));
+    }
+    text
+}
+
+/// "3 other host(s) answered." and, when some of them need a manual check,
+/// "2 of them need a look (Espressif Inc., Raspberry Pi Trading Ltd)."
+pub fn others_summary(report: &LanReport) -> String {
+    let mut vendors: Vec<&str> = Vec::new();
+    let check = report.others.iter().filter(|other| other.needs_check);
+    for vendor in check.clone().filter_map(|other| other.vendor.as_deref()) {
+        if !vendors.contains(&vendor) {
+            vendors.push(vendor);
+        }
+    }
+    let mut text = format!("{} other host(s) answered.", report.others.len());
+    match check.count() {
+        0 => {}
+        1 => text.push_str(&format!(" 1 of them needs a look ({}).", vendors.join(", "))),
+        count => text.push_str(&format!(" {count} of them need a look ({}).", vendors.join(", "))),
+    }
+    text
 }
 
 /// One-line summary of why a network host looks like a camera.
@@ -785,7 +816,7 @@ pub fn lan_evidence(host: &LanHost) -> String {
     if let (false, Some(vendor)) = (host.camera_vendor, &host.vendor) {
         parts.push(format!("vendor: {vendor}"));
     }
-    parts.join("; ")
+    format!("{}{}", parts.join("; "), name_suffix(host.name.as_deref(), &host.services))
 }
 
 #[cfg(test)]
@@ -927,12 +958,17 @@ mod tests {
                 open_ports: vec![OpenPort { port: 554, meaning: "RTSP video stream" }],
                 rtsp: Some("Hipcam".into()),
                 onvif: None,
+                name: None,
+                services: Vec::new(),
             }],
             others: vec![Neighbour {
                 ip: Ipv4Addr::new(192, 168, 1, 1),
                 mac: "00:11:22:33:44:55".into(),
                 vendor: Some("Router Maker".into()),
                 note: None,
+                needs_check: false,
+                name: None,
+                services: Vec::new(),
             }],
         })));
         let screen = render(&mut app);
@@ -999,7 +1035,12 @@ mod tests {
         let mut app = App::new(session(), &noop);
         let (tx, rx) = std::sync::mpsc::channel();
         tx.send(AppEvent::Ble(BleEvent::Started("hci0".into()))).unwrap();
-        tx.send(AppEvent::Ble(BleEvent::Advert(Advert { id: "new".into(), ..Default::default() }))).unwrap();
+        tx.send(AppEvent::Ble(BleEvent::Advert(Advert {
+            id: "new".into(),
+            rssi: Some(-60),
+            ..Default::default()
+        })))
+        .unwrap();
         let mut release = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
         release.kind = KeyEventKind::Release;
         let keys = vec![Ok(None), Ok(Some(release)), Ok(press(KeyCode::Tab)), Ok(press(KeyCode::Char('q')))];
@@ -1187,7 +1228,7 @@ mod tests {
         let mut session = session();
         let long_ago = Instant::now().checked_sub(Duration::from_secs(90)).unwrap();
         session.ingest_at(Advert { id: "old".into(), rssi: Some(-50), ..Default::default() }, long_ago);
-        session.ingest(Advert { id: "quiet".into(), ..Default::default() });
+        session.ingest(Advert { id: "quiet".into(), name: Some("Quiet".into()), ..Default::default() });
         session.ingest(Advert { id: "far".into(), rssi: Some(-90), ..Default::default() });
         let mut app = App::new(session, &noop);
 
@@ -1320,6 +1361,9 @@ mod tests {
             mac: format!("00:11:22:33:44:{last:02x}"),
             vendor: vendor.map(str::to_string),
             note,
+            needs_check: vendor.is_some(),
+            name: (last == 2).then(|| "heat-hub.local".to_string()),
+            services: if last == 2 { vec!["_hap._tcp".into(), "_meshcop._udp".into()] } else { Vec::new() },
         };
         app.on_app_event(AppEvent::Lan(Ok(LanReport {
             networks: vec!["10.0.0.0/24 (en0)".into()],
@@ -1334,6 +1378,8 @@ mod tests {
                 open_ports: vec![OpenPort { port: 8000, meaning: "Hikvision device port" }],
                 rtsp: None,
                 onvif: None,
+                name: Some("nvr.lan".into()),
+                services: Vec::new(),
             }],
             others: vec![
                 other(2, Some("Espressif Inc."), Some("Wi-Fi chip")),
@@ -1343,12 +1389,52 @@ mod tests {
         })));
         app.on_key(KeyCode::Char('a'));
         let screen = render(&mut app);
-        assert!(screen.contains("1 host(s) with camera evidence. 3 other host(s) answered."), "{screen}");
+        assert!(
+            screen.contains(
+                "1 host(s) with camera evidence. 3 other host(s) answered. 1 of them needs a look (Espressif Inc.)."
+            ),
+            "{screen}"
+        );
         assert!(screen.contains("maybe"), "{screen}");
-        assert!(screen.contains("port 8000 (Hikvision device port)"), "{screen}");
-        assert!(screen.contains("Espressif Inc. (Wi-Fi chip)"), "{screen}");
+        assert!(screen.contains("port 8000 (Hikvision device port); name: nvr.lan"), "{screen}");
+        assert!(
+            screen.contains(
+                "Espressif Inc. (Wi-Fi chip); name: heat-hub.local; services: _hap._tcp, _meshcop._udp"
+            ),
+            "{screen}"
+        );
         assert!(screen.contains("private address"), "{screen}");
         assert!(screen.contains("unknown vendor"), "{screen}");
+    }
+
+    #[test]
+    fn others_summary_names_each_vendor_once() {
+        let other = |last: u8, vendor: &str, needs_check| Neighbour {
+            ip: Ipv4Addr::new(10, 0, 0, last),
+            mac: format!("00:11:22:33:44:{last:02x}"),
+            vendor: Some(vendor.into()),
+            note: None,
+            needs_check,
+            name: None,
+            services: Vec::new(),
+        };
+        let report = LanReport {
+            networks: vec![],
+            addresses_probed: 253,
+            seconds: 4.0,
+            hosts: vec![],
+            others: vec![
+                other(2, "Espressif Inc.", true),
+                other(3, "Router Maker", false),
+                other(4, "Espressif Inc.", true),
+                other(5, "Raspberry Pi Trading Ltd", true),
+            ],
+        };
+        assert_eq!(
+            others_summary(&report),
+            "4 other host(s) answered. 3 of them need a look (Espressif Inc., Raspberry Pi Trading Ltd)."
+        );
+        assert_eq!(name_suffix(None, &[]), "");
     }
 
     #[test]
@@ -1362,6 +1448,8 @@ mod tests {
             open_ports: vec![],
             rtsp: Some("yes".into()),
             onvif: Some(Onvif { name: Some("Door".into()), hardware: Some("DS-2".into()), address: None }),
+            name: None,
+            services: Vec::new(),
         };
         assert_eq!(
             lan_evidence(&host),

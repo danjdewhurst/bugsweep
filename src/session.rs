@@ -69,6 +69,13 @@ impl Device {
         self.follow.filter(|_| !self.known)
     }
 
+    /// All identity keys of the device, strongest first, as the log
+    /// stores them.
+    pub fn keys(&self) -> Vec<String> {
+        let stable = self.payload_since.elapsed() >= PAYLOAD_STABLE_AFTER;
+        identity::keys(&self.advert, stable).into_iter().map(|key| key.text).collect()
+    }
+
     pub fn age(&self) -> Duration {
         self.last_seen.elapsed()
     }
@@ -119,9 +126,14 @@ impl Session {
         self.ingest_at(advert, Instant::now());
     }
 
-    /// Take in the advertisement data of one device, received at `now`.
+    /// Take in the advertisement data of one device, received at `now`. A
+    /// new device whose advert carries nothing and matches no signature is
+    /// left out: it is noise. An address alone can match a signature.
     pub(crate) fn ingest_at(&mut self, mut advert: Advert, now: Instant) {
         let hits = self.db.classify(&advert);
+        if advert.is_empty() && hits.is_empty() && !self.devices.contains_key(&advert.id) {
+            return;
+        }
         let device = match self.devices.entry(advert.id.clone()) {
             Entry::Occupied(entry) => {
                 let device = entry.into_mut();
@@ -327,6 +339,28 @@ mod tests {
     }
 
     #[test]
+    fn empty_adverts_are_left_out() {
+        let mut session = session();
+        session.ingest(Advert { id: "ghost".into(), ..Default::default() });
+        assert!(session.is_empty());
+        // Nothing went to the log.
+        let store = session.store.as_ref().unwrap();
+        assert_eq!(store.seen("id:ghost").unwrap(), (false, None));
+        // An address that matches a signature is data: it stays.
+        let axon =
+            Advert { id: "cam".into(), address: Some("00:25:DF:00:00:01".into()), ..Default::default() };
+        assert!(axon.is_empty());
+        session.ingest(axon);
+        assert!(session.get("cam").is_some_and(|device| !device.hits.is_empty()));
+        // A device that sent data before stays when an empty update comes.
+        session.ingest(advert("real", -60));
+        session.ingest(Advert { id: "real".into(), ..Default::default() });
+        assert_eq!(session.len(), 2);
+        assert_eq!(session.get("real").unwrap().updates, 2);
+        assert_eq!(session.get("real").unwrap().keys(), ["id:real"]);
+    }
+
+    #[test]
     fn flagged_devices_sort_first() {
         let mut session = session();
         session.ingest(advert("plain-near", -30));
@@ -511,7 +545,7 @@ mod tests {
     fn first_signal_value_starts_the_average() {
         let mut session = Session::new(db(), None, "office".into());
         assert!(session.is_empty());
-        session.ingest(Advert { id: "a".into(), ..Default::default() });
+        session.ingest(Advert { id: "a".into(), name: Some("Lamp".into()), ..Default::default() });
         assert_eq!(session.get("a").unwrap().rssi_avg, None);
         assert_eq!(session.get("a").unwrap().distance_m(), None);
         session.ingest(advert("a", -60));

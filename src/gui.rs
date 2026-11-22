@@ -23,7 +23,7 @@ use crate::signatures::Level;
 use crate::store::Follower;
 use crate::tui::{
     AppEvent, FINDER_SAMPLES, FinderReading, STALE_AFTER, TICK, detail_fields, finding_text, follow_warning,
-    format_age, format_distance, lan_evidence, level_tag, neighbour_detail, signal_percent,
+    format_age, format_distance, lan_evidence, level_tag, neighbour_detail, others_summary, signal_percent,
 };
 
 const GREEN: Color32 = Color32::from_rgb(40, 170, 90);
@@ -550,13 +550,13 @@ fn lan_report(ui: &mut Ui, report: &LanReport, show_all: bool) {
         report.seconds,
         report.networks.join(", ")
     ));
-    let others = report.others.len();
+    let others = others_summary(report);
     if report.hosts.is_empty() {
-        ui.colored_label(GREEN, format!("No camera evidence found. {others} other host(s) answered."));
+        ui.colored_label(GREEN, format!("No camera evidence found. {others}"));
     } else {
         ui.colored_label(
             ui.visuals().warn_fg_color,
-            format!("{} host(s) with camera evidence. {others} other host(s) answered.", report.hosts.len()),
+            format!("{} host(s) with camera evidence. {others}", report.hosts.len()),
         );
     }
     ui.add_space(8.0);
@@ -882,7 +882,12 @@ name_regex = "^InfoTag"
         let live = Mutex::new(Live::new(Session::new(db, None, "car".into())));
         let (tx, rx) = mpsc::channel();
         tx.send(AppEvent::Ble(BleEvent::Started("hci0".into()))).unwrap();
-        tx.send(AppEvent::Ble(BleEvent::Advert(Advert { id: "tag".into(), ..Default::default() }))).unwrap();
+        tx.send(AppEvent::Ble(BleEvent::Advert(Advert {
+            id: "tag".into(),
+            rssi: Some(-60),
+            ..Default::default()
+        })))
+        .unwrap();
         tx.send(AppEvent::Lan(Err("no network".into()))).unwrap();
         drop(tx);
         pump(rx, &live);
@@ -910,6 +915,9 @@ name_regex = "^InfoTag"
                 mac: "00:11:22:33:44:55".into(),
                 vendor: Some("Router Maker".into()),
                 note: None,
+                needs_check: false,
+                name: None,
+                services: Vec::new(),
             }],
         }
     }
@@ -924,6 +932,8 @@ name_regex = "^InfoTag"
             open_ports: vec![OpenPort { port: 554, meaning: "RTSP video stream" }],
             rtsp: Some("Hipcam".into()),
             onvif: None,
+            name: None,
+            services: Vec::new(),
         }
     }
 
@@ -964,6 +974,17 @@ name_regex = "^InfoTag"
 
         deliver(&mut harness, AppEvent::Lan(Ok(report(Vec::new()))));
         assert!(has(&harness, "No camera evidence found. 1 other host(s) answered."));
+
+        let mut chip = report(Vec::new());
+        chip.others[0].needs_check = true;
+        chip.others[0].name = Some("heat-hub.local".into());
+        click(&mut harness, "Sweep again");
+        deliver(&mut harness, AppEvent::Lan(Ok(chip)));
+        assert!(has(
+            &harness,
+            "No camera evidence found. 1 other host(s) answered. 1 of them needs a look (Router Maker)."
+        ));
+        assert!(has(&harness, "Router Maker; name: heat-hub.local"));
     }
 
     #[test]

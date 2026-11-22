@@ -46,6 +46,36 @@ impl Basis {
     }
 }
 
+/// The prefixes of the stored keys.
+const PREFIXES: &[&str] = &["id", "findmy", "fmdn", "smarttag", "name", "data", "svc"];
+
+/// The stored key for a device ID that a person or a script gives: a key as
+/// `followers` or `scan --json` prints it ("id:…", "name:…", "findmy:…"), or
+/// a bare platform ID as in the `id` field of `scan --json`. The prefix can
+/// have any case, and a key of hex data gets lower case, as the log stores
+/// it. `None` when the ID is empty.
+pub fn key_from_user(text: &str) -> Option<String> {
+    let text = text.trim();
+    let Some((prefix, rest)) = text
+        .split_once(':')
+        .map(|(prefix, rest)| (prefix.to_ascii_lowercase(), rest.trim()))
+        .filter(|(prefix, _)| PREFIXES.contains(&prefix.as_str()))
+    else {
+        return (!text.is_empty()).then(|| format!("id:{text}"));
+    };
+    let rest = match prefix.as_str() {
+        "id" | "name" => rest.to_string(),
+        _ => rest.to_ascii_lowercase(),
+    };
+    (!rest.is_empty()).then(|| format!("{prefix}:{rest}"))
+}
+
+/// A key that another device can copy: a name or a payload. A mark on such
+/// a key also hides each other device that sends the same name or payload.
+pub fn is_copyable(key: &str) -> bool {
+    matches!(Basis::of_key(key), Basis::Name | Basis::Data)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Key {
     pub basis: Basis,
@@ -118,6 +148,23 @@ pub fn keys(advert: &Advert, payload_stable: bool) -> Vec<Key> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keys_from_people_and_scripts() {
+        assert_eq!(key_from_user(" 5F3A-UUID ").as_deref(), Some("id:5F3A-UUID"));
+        // A Windows ID is a MAC address, and its first octet is not a prefix.
+        assert_eq!(key_from_user("AA:BB:CC:DD:EE:FF").as_deref(), Some("id:AA:BB:CC:DD:EE:FF"));
+        assert_eq!(key_from_user("hci0/dev_AA_BB").as_deref(), Some("id:hci0/dev_AA_BB"));
+        assert_eq!(key_from_user("id:abc").as_deref(), Some("id:abc"));
+        assert_eq!(key_from_user("ID:Abc").as_deref(), Some("id:Abc"));
+        assert_eq!(key_from_user("FINDMY:00FF").as_deref(), Some("findmy:00ff"));
+        assert_eq!(key_from_user("svc: FD5A:0A ").as_deref(), Some("svc:fd5a:0a"));
+        assert_eq!(key_from_user("name: My watch").as_deref(), Some("name:My watch"));
+        assert_eq!(key_from_user(""), None);
+        assert_eq!(key_from_user("name: "), None);
+        assert!(is_copyable("name:My watch") && is_copyable("data:004c:00") && is_copyable("svc:fd5a:00"));
+        assert!(!is_copyable("id:abc") && !is_copyable("findmy:00"));
+    }
 
     fn texts(advert: &Advert, stable: bool) -> Vec<String> {
         keys(advert, stable).into_iter().map(|k| k.text).collect()

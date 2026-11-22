@@ -14,13 +14,14 @@ use futures::future::BoxFuture;
 use serde_json::json;
 
 use crate::ble::BleEvent;
+use crate::identity;
 use crate::lan::{LanReport, Verdict};
-use crate::model::uuid_label;
+use crate::model::{printable, uuid_label};
 use crate::place;
 use crate::session::{Session, follow_text};
 use crate::signatures::SignatureDb;
 use crate::store::{self, Store};
-use crate::tui::{AppEvent, format_age, format_distance, lan_evidence};
+use crate::tui::{AppEvent, format_age, format_distance, lan_evidence, name_suffix, others_summary};
 
 /// The parts of the machine that the commands use.
 pub trait Hardware: Sync {
@@ -86,10 +87,37 @@ enum Cmd {
     },
     /// List devices that the log has at two or more places.
     Followers,
+    /// List, add or remove the devices that you marked as known (yours).
+    /// A known device is never flagged and never a follower.
+    Known {
+        #[command(subcommand)]
+        action: KnownCmd,
+    },
     /// List the signature database.
     Signatures,
     /// Open the desktop window.
     Gui,
+}
+
+#[derive(Subcommand)]
+enum KnownCmd {
+    /// List the keys that are marked as known.
+    List {
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Mark devices as known. Give the `id` from `scan --json`, or a key
+    /// that `followers` prints, for example `id:…`, `name:…` or `findmy:…`.
+    Add {
+        #[arg(required = true, value_name = "ID")]
+        ids: Vec<String>,
+    },
+    /// Remove the known mark. Takes the same IDs as `add`.
+    Remove {
+        #[arg(required = true, value_name = "ID")]
+        ids: Vec<String>,
+    },
 }
 
 /// Standard output and standard error of a command.
@@ -110,12 +138,8 @@ pub fn run(args: Vec<OsString>, hardware: &dyn Hardware, io: Output) -> Result<(
     match &cli.command {
         Some(Cmd::Signatures) => list_signatures(&db, io.out),
         Some(Cmd::Lan { json, all }) => run_lan(hardware, *json, *all, io),
-        Some(Cmd::Followers) => {
-            let Some(store) = open_store(&cli)? else {
-                bail!("the log is off (--no-log)");
-            };
-            list_followers(&store, io.out)
-        }
+        Some(Cmd::Followers) => list_followers(&log_store(&cli)?, io.out),
+        Some(Cmd::Known { action }) => run_known(&log_store(&cli)?, action, io.out),
         Some(Cmd::Scan { seconds, json, flagged }) => {
             let session = new_session(&cli, db)?;
             run_scan(hardware, session, *seconds, *json, *flagged, io)
@@ -140,6 +164,14 @@ fn open_store(cli: &Cli) -> Result<Option<Store>> {
         None => store::default_path().context("cannot find a data directory; use --db")?,
     };
     Store::open(&path).map(Some)
+}
+
+/// The log, for a command that cannot work without it.
+fn log_store(cli: &Cli) -> Result<Store> {
+    match open_store(cli)? {
+        Some(store) => Ok(store),
+        None => bail!("the log is off (--no-log)"),
+    }
 }
 
 fn new_session(cli: &Cli, db: Arc<SignatureDb>) -> Result<Session> {
@@ -251,6 +283,7 @@ fn print_scan_json(session: &Session, flagged_only: bool, out: &mut dyn Write) -
                 "known": device.known,
                 "other_places": device.follow().map(|f| f.places).unwrap_or(0),
                 "other_places_match": device.follow().map(|f| f.basis.label()),
+                "keys": device.keys(),
                 "findings": device.hits.iter().map(|&i| session.db().get(i).id.clone()).collect::<Vec<_>>(),
                 "company_ids": advert.manufacturer_data.keys().map(|id| format!("{id:#06x}")).collect::<Vec<_>>(),
                 "services": advert.services.iter().map(uuid_label).collect::<Vec<_>>(),
@@ -342,16 +375,17 @@ fn run_lan(hardware: &dyn Hardware, as_json: bool, all: bool, io: Output) -> Res
         for other in &report.others {
             writeln!(
                 io.out,
-                "{:<7} {:<16} {:<18} {}{}",
+                "{:<7} {:<16} {:<18} {}{}{}",
                 "-",
                 other.ip,
                 other.mac,
                 other.vendor.as_deref().unwrap_or("unknown vendor"),
-                other.note.map(|note| format!(" ({note})")).unwrap_or_default()
+                other.note.map(|note| format!(" ({note})")).unwrap_or_default(),
+                name_suffix(other.name.as_deref(), &other.services),
             )?;
         }
     } else {
-        writeln!(io.out, "{} other host(s) answered. Use --all to list them.", report.others.len())?;
+        writeln!(io.out, "{} Use --all to list them.", others_summary(&report))?;
     }
     writeln!(io.err, "A camera on a different network, or one that only records to a card, stays hidden.")?;
     Ok(())
@@ -377,6 +411,60 @@ fn list_followers(store: &Store, out: &mut dyn Write) -> Result<()> {
             ago(follower.first_seen),
             ago(follower.last_seen),
         )?;
+    }
+    Ok(())
+}
+
+fn run_known(store: &Store, action: &KnownCmd, out: &mut dyn Write) -> Result<()> {
+    let keys = |ids: &[String]| -> Result<Vec<String>> {
+        ids.iter()
+            .map(|id| identity::key_from_user(id).with_context(|| format!("not a device ID: {id:?}")))
+            .collect()
+    };
+    match action {
+        KnownCmd::List { json } => list_known(store, *json, out),
+        KnownCmd::Add { ids } => {
+            for key in keys(ids)? {
+                let (seen, title) = store.seen(&key)?;
+                store.set_known(&key, title.as_deref(), true)?;
+                let title = title.map(|title| format!(" ({})", printable(&title))).unwrap_or_default();
+                let unseen = if seen { "" } else { " The log has no sighting of it yet." };
+                writeln!(out, "Marked {}{title} as known.{unseen}", printable(&key))?;
+                if identity::is_copyable(&key) {
+                    writeln!(out, "  Each other device that sends this name or data is now known too.")?;
+                }
+            }
+            Ok(())
+        }
+        KnownCmd::Remove { ids } => {
+            let marked = store.known_keys()?;
+            for key in keys(ids)? {
+                if marked.contains(&key) {
+                    store.set_known(&key, None, false)?;
+                    writeln!(out, "Removed the known mark from {}.", printable(&key))?;
+                } else {
+                    writeln!(out, "{} is not marked as known.", printable(&key))?;
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn list_known(store: &Store, as_json: bool, out: &mut dyn Write) -> Result<()> {
+    let known = store.known()?;
+    if as_json {
+        let list: Vec<_> =
+            known.iter().map(|k| json!({ "key": k.key, "title": k.title, "added": k.added })).collect();
+        writeln!(out, "{}", serde_json::to_string_pretty(&json!({ "known": list }))?)?;
+        return Ok(());
+    }
+    if known.is_empty() {
+        writeln!(out, "No device is marked as known.")?;
+    }
+    for k in known {
+        let title = k.title.as_deref().map(printable).unwrap_or_else(|| "(no name)".into());
+        writeln!(out, "{}  {title}", printable(&k.key))?;
     }
     Ok(())
 }
@@ -578,6 +666,9 @@ mod tests {
         assert_eq!(tag["flagged"], true);
         assert_eq!(tag["other_places"], 1);
         assert_eq!(tag["other_places_match"], "ID");
+        let keys = tag["keys"].as_array().unwrap();
+        assert_eq!(keys[0], "id:tag-1");
+        assert!(keys[1].as_str().unwrap().starts_with("findmy:"), "{keys:?}");
         assert_eq!(tag["findings"][0], "apple-airtag-separated");
         assert_eq!(tag["company_ids"][0], "0x004c");
         assert_eq!(tag["services"][0], tag["service_data"][0]);
@@ -674,12 +765,17 @@ mod tests {
             open_ports: vec![OpenPort { port: 554, meaning: "RTSP video stream" }],
             rtsp: None,
             onvif: Some(Onvif::default()),
+            name: (last == 5).then(|| "door-cam.local".to_string()),
+            services: Vec::new(),
         };
         let other = |last, vendor: Option<&str>, note| Neighbour {
             ip: Ipv4Addr::new(192, 168, 1, last),
             mac: format!("00:11:22:00:00:{last:02}"),
             vendor: vendor.map(str::to_string),
             note,
+            needs_check: vendor.is_some(),
+            name: vendor.map(|_| "heat-hub.local".to_string()),
+            services: if vendor.is_some() { vec!["_meshcop._udp".into()] } else { Vec::new() },
         };
         Ok(report(
             vec![host(5, Verdict::Likely, Some("00:11:22:00:00:05")), host(6, Verdict::Possible, None)],
@@ -696,21 +792,35 @@ mod tests {
         let (out, err) = run_with(&lan_fake(cameras), &["lan"]).unwrap();
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], "253 addresses checked in 4.0 s on 192.168.1.0/24 (en0).");
-        assert!(lines[1].starts_with("LIKELY  192.168.1.5      00:11:22:00:00:05  ONVIF camera"), "{out}");
+        assert_eq!(
+            lines[1],
+            "LIKELY  192.168.1.5      00:11:22:00:00:05  ONVIF camera; port 554 (RTSP video stream); name: door-cam.local"
+        );
         assert!(lines[2].starts_with("maybe   192.168.1.6      -"), "{out}");
-        assert_eq!(lines[3], "2 other host(s) answered. Use --all to list them.");
+        assert_eq!(
+            lines[3],
+            "2 other host(s) answered. 1 of them needs a look (Espressif Inc.). Use --all to list them."
+        );
         assert!(err.starts_with("Sweeping the local network"), "{err}");
         assert!(err.contains("stays hidden"), "{err}");
 
         let (out, _) = run_with(&lan_fake(cameras), &["lan", "--all"]).unwrap();
-        assert!(out.contains("192.168.1.7      00:11:22:00:00:07  Espressif Inc. (Wi-Fi chip)"), "{out}");
+        assert!(
+            out.contains(
+                "192.168.1.7      00:11:22:00:00:07  Espressif Inc. (Wi-Fi chip); name: heat-hub.local; services: _meshcop._udp\n"
+            ),
+            "{out}"
+        );
         assert!(out.contains("192.168.1.8      00:11:22:00:00:08  unknown vendor\n"), "{out}");
     }
 
     #[test]
     fn lan_without_cameras() {
         let (out, _) = run_with(&Fake::new(Vec::new), &["lan"]).unwrap();
-        assert!(out.contains("No camera evidence found."), "{out}");
+        assert!(
+            out.contains("No camera evidence found.\n0 other host(s) answered. Use --all to list them."),
+            "{out}"
+        );
     }
 
     #[test]
@@ -719,7 +829,13 @@ mod tests {
         assert_eq!(err, "");
         let value: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(value["hosts"][0]["verdict"], "likely");
+        assert_eq!(value["hosts"][0]["name"], "door-cam.local");
+        assert_eq!(value["hosts"][0]["services"], json!([]));
+        assert_eq!(value["hosts"][1]["name"], serde_json::Value::Null);
+        assert_eq!(value["others"][0]["needs_check"], true);
+        assert_eq!(value["others"][0]["services"][0], "_meshcop._udp");
         assert_eq!(value["others"][1]["mac"], "00:11:22:00:00:08");
+        assert_eq!(value["others"][1]["needs_check"], false);
     }
 
     #[test]
@@ -746,6 +862,57 @@ mod tests {
         // The clock can pass a second boundary while the test runs.
         let ages = ["0s ago, last seen 0s ago", "1s ago, last seen 1s ago", "1s ago, last seen 0s ago"];
         assert!(ages.iter().any(|age| out.contains(&format!("first seen {age}"))), "{out}");
+    }
+
+    #[test]
+    fn known_marks_and_lists_devices() {
+        let dir = TempDir::new().unwrap();
+        let db = db_arg(&dir);
+        let store = Store::open(Path::new(&db)).unwrap();
+        store.record("id:PHONE-1", "home", Some(-40), Some("My phone"), None).unwrap();
+        store.record("id:evil", "home", None, Some("Tag\u{1b}[2J"), None).unwrap();
+        store.record("findmy:abcd", "home", None, None, None).unwrap();
+        drop(store);
+        let known = |args: &[&str]| {
+            let all: Vec<&str> = ["--db", db.as_str(), "known"].iter().chain(args).copied().collect();
+            run_with(&Fake::new(Vec::new), &all).map(|(out, _)| out)
+        };
+
+        assert_eq!(known(&["list"]).unwrap(), "No device is marked as known.\n");
+        // A bare ID from `scan --json` and keys from `followers` work.
+        let out = known(&["add", "PHONE-1", "FINDMY:ABCD", "name: Desk lamp"]).unwrap();
+        assert_eq!(
+            out,
+            "Marked id:PHONE-1 (My phone) as known.\n\
+             Marked findmy:abcd as known.\n\
+             Marked name:Desk lamp as known. The log has no sighting of it yet.\n\
+             \x20 Each other device that sends this name or data is now known too.\n"
+        );
+        // Device text reaches the terminal without control characters.
+        assert_eq!(known(&["add", "evil"]).unwrap(), "Marked id:evil (Tag[2J) as known.\n");
+        let out = known(&["list"]).unwrap();
+        assert!(out.contains("id:PHONE-1  My phone\n"), "{out}");
+        assert!(out.contains("findmy:abcd  (no name)\n"), "{out}");
+        assert!(out.contains("id:evil  Tag[2J\n"), "{out}");
+        assert_eq!(out.lines().count(), 4, "{out}");
+
+        let value: serde_json::Value = serde_json::from_str(&known(&["list", "--json"]).unwrap()).unwrap();
+        let list = value["known"].as_array().unwrap();
+        assert_eq!(list.len(), 4);
+        let phone = list.iter().find(|k| k["key"] == "id:PHONE-1").unwrap();
+        assert_eq!(phone["title"], "My phone");
+        assert!(phone["added"].as_i64().unwrap() > 0);
+
+        let out = known(&["remove", "id:PHONE-1", "id:other"]).unwrap();
+        assert_eq!(out, "Removed the known mark from id:PHONE-1.\nid:other is not marked as known.\n");
+        assert!(!known(&["list"]).unwrap().contains("PHONE-1"));
+
+        // An empty ID, no ID, and no log.
+        assert_eq!(known(&["add", " "]).unwrap_err().to_string(), "not a device ID: \" \"");
+        assert_eq!(known(&["remove", "id:"]).unwrap_err().to_string(), "not a device ID: \"id:\"");
+        assert!(known(&["add"]).unwrap_err().downcast_ref::<clap::Error>().is_some());
+        let error = run_with(&Fake::new(Vec::new), &["--no-log", "known", "list"]).unwrap_err();
+        assert_eq!(error.to_string(), "the log is off (--no-log)");
     }
 
     #[test]
@@ -820,5 +987,24 @@ mod tests {
         check_write_errors(&lan_fake(cameras), &["lan", "--all"]);
         check_write_errors(&lan_fake(cameras), &["lan"]);
         check_write_errors(&lan_fake(cameras), &["lan", "--json"]);
+        check_write_errors(&Fake::new(Vec::new), &["--db", &db, "known", "list"]);
+        check_write_errors(&Fake::new(Vec::new), &["--db", &db, "known", "add", "tag-1"]);
+        check_write_errors(&Fake::new(Vec::new), &["--db", &db, "known", "list"]);
+        check_write_errors(&Fake::new(Vec::new), &["--db", &db, "known", "list", "--json"]);
+        check_write_errors(&Fake::new(Vec::new), &["--db", &db, "known", "add", "name:Tag"]);
+        // Each run of a removal must find the mark, so mark the key again
+        // before each run.
+        let remove = command_line(&["--db", &db, "known", "remove", "tag-1"]);
+        let removed = "Removed the known mark from id:tag-1.\n".len();
+        for size in [0, removed - 1] {
+            Store::open(Path::new(&db)).unwrap().set_known("id:tag-1", None, true).unwrap();
+            let mut small = vec![0u8; size];
+            let mut full = std::io::Cursor::new(&mut small[..]);
+            let error =
+                run(remove.clone(), &Fake::new(Vec::new), Output { out: &mut full, err: &mut Vec::new() })
+                    .unwrap_err();
+            assert!(error.downcast_ref::<std::io::Error>().is_some(), "{error}");
+        }
+        check_write_errors(&Fake::new(Vec::new), &["--db", &db, "known", "remove", "tag-1", "tag-2"]);
     }
 }
