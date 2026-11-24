@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/danjdewhurst/bugsweep/compare/v0.2.0...v0.3.0) (2026-11-24)
+
+
+### Features
+
+* name LAN hosts, add the known command, and drop empty BLE devices ([#10](https://github.com/danjdewhurst/bugsweep/issues/10)) ([ad080e8](https://github.com/danjdewhurst/bugsweep/commit/ad080e8f3a29dbf203bc270dd04f62f48e3cc475))
+
 ## [0.2.0](https://github.com/danjdewhurst/bugsweep/compare/v0.1.1...v0.2.0) (2026-11-14)
 
 
