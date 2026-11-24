@@ -1,6 +1,6 @@
 [package]
 name = "bugsweep"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "A radio check for trackers, cameras, recorders and smart glasses, on an ordinary laptop."
 authors = ["Dan Dewhurst"]
